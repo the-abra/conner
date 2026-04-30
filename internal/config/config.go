@@ -32,4 +32,5 @@ const (
 	MsgTypeMediaInfo = "MEDIA_INFO"
 	MsgTypeMediaData = "MEDIA_DATA"
 	MsgTypeDownloadReq = "DOWNLOAD_REQ"
+	MsgTypeMediaRegister = "MEDIA_REGISTER"
 )

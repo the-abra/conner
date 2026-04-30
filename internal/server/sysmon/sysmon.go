@@ -57,8 +57,6 @@ type Snapshot struct {
 // NetIface is per-interface RX/TX counters.
 type NetIface struct {
 	Name   string
-	RxBytes uint64
-	TxBytes uint64
 }
 
 // Collect reads all metrics that are accessible without elevated privileges.
@@ -144,12 +142,10 @@ func Collect() Snapshot {
 			if len(fields) < 9 {
 				continue
 			}
-			rx, _ := strconv.ParseUint(fields[0], 10, 64)
-			tx, _ := strconv.ParseUint(fields[8], 10, 64)
+			_, _ = strconv.ParseUint(fields[0], 10, 64)
+			_, _ = strconv.ParseUint(fields[8], 10, 64)
 			s.NetIfaces = append(s.NetIfaces, NetIface{
 				Name:    name,
-				RxBytes: rx,
-				TxBytes: tx,
 			})
 		}
 		f.Close()

@@ -25,6 +25,8 @@ var (
 	clrDim     = lipgloss.Color("#555555") // dim gray — decorators
 	clrGreen   = lipgloss.Color("#00FF41")
 	clrDkGreen = lipgloss.Color("#008F11")
+	clrYellow  = lipgloss.Color("#FFFF00")
+	clrBlue    = lipgloss.Color("#4B9EFF")
 	clrInput   = lipgloss.Color("#AAAAAA")
 
 	styleSelf   = lipgloss.NewStyle().Foreground(clrSelf).Bold(true)
@@ -41,6 +43,24 @@ var (
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(clrDkGreen).
 			MarginBottom(1)
+
+	styleUserList = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(clrDim).
+			Padding(0, 1).
+			Foreground(clrMsgBody)
+
+	stylePendingBox = lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(clrYellow).
+			Padding(1, 2).
+			Foreground(clrMsgBody)
+
+	styleApprovedBox = lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(clrGreen).
+			Padding(1, 2).
+			Foreground(clrMsgBody)
 
 	styleInputBox = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -75,6 +95,8 @@ type model struct {
 	lines       []string // rendered lines in the viewport
 	showHelp    bool
 	isUploading bool
+	state       string   // PENDING, WHITELISTED
+	onlineUsers []string
 }
 
 func InitialModel(c *client.Client, nick string) tea.Model {
@@ -91,6 +113,7 @@ func InitialModel(c *client.Client, nick string) tea.Model {
 		nickname: nick,
 		input:    ti,
 		viewport: vp,
+		state:    "PENDING",
 	}
 }
 
@@ -113,6 +136,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case incomingMsg:
+		if msg.Type == config.MsgTypeSystem {
+			if strings.Contains(msg.Content, "Waiting for admin approval") {
+				m.state = "PENDING"
+			} else if strings.Contains(msg.Content, "You have been approved") {
+				m.state = "APPROVED"
+			}
+		}
+		if msg.Type == config.MsgTypeUserList {
+			m.onlineUsers = strings.Split(msg.Content, ",")
+		}
 		m.lines = append(m.lines, m.renderMessage(protocol.ChatMessage(msg)))
 		m.refreshViewport()
 		cmds = append(cmds, m.waitForMsg())
@@ -178,6 +211,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
+			if m.state == "APPROVED" {
+				m.state = "WHITELISTED"
+				return m, nil
+			}
 			if m.showHelp {
 				m.showHelp = false
 				break
@@ -333,8 +370,42 @@ func (m model) View() string {
 		return "Connecting…"
 	}
 
+	// ── Overlay: PENDING ──────────────────────────────────────────────────
+	if m.state == "PENDING" {
+		pending := fmt.Sprintf(`
+  CONNECTION ESTABLISHED
+  ─────────────────────────────────────────────
+  Your nickname: %s
+  
+  Please wait for an administrator to approve
+  your connection.
+  
+  [ESC] Disconnect
+`, m.nickname)
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			stylePendingBox.Render(pending))
+	}
+
+	// ── Overlay: APPROVED ─────────────────────────────────────────────────
+	if m.state == "APPROVED" {
+		approved := fmt.Sprintf(`
+  ACCESS GRANTED
+  ─────────────────────────────────────────────
+  You have been approved by an admin!
+  
+  Nickname: %s
+  
+  Press [ ENTER ] to join the chat.
+`, m.nickname)
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			styleApprovedBox.Render(approved))
+	}
+
+	// ── Overlay: HELP ─────────────────────────────────────────────────────
 	if m.showHelp {
-		help := fmt.Sprintf(`
+		help := `
   CONNER CLIENT — Commands
   ─────────────────────────────────────
   /list              List online users
@@ -349,12 +420,13 @@ func (m model) View() string {
   [ESC / Enter / F1] Close this menu
   [↑ ↓ PgUp PgDn]    Scroll chat
   [Ctrl+C]           Force quit
-`)
+`
 		return lipgloss.Place(m.width, m.height,
 			lipgloss.Center, lipgloss.Center,
 			styleHelp.Render(help))
 	}
 
+	// ── Main Chat View (WHITELISTED) ──────────────────────────────────────
 	var sb strings.Builder
 
 	// Title bar
@@ -366,8 +438,31 @@ func (m model) View() string {
 		Render(fmt.Sprintf(" CONNER  ·  %s%s", m.nickname, status)))
 	sb.WriteString("\n")
 
-	// Chat viewport
-	sb.WriteString(m.viewport.View())
+	// Split View: Chat (left) | Users (right)
+	userListWidth := 20
+	chatWidth := m.width - userListWidth - 2
+	if chatWidth < 20 {
+		chatWidth = m.width - 2
+		userListWidth = 0
+	}
+
+	m.viewport.Width = chatWidth
+	chatView := m.viewport.View()
+
+	if userListWidth > 0 {
+		var userListSB strings.Builder
+		userListSB.WriteString(lipgloss.NewStyle().Bold(true).Underline(true).Render("ONLINE USERS") + "\n")
+		for _, u := range m.onlineUsers {
+			userListSB.WriteString("• " + u + "\n")
+		}
+		userListStr := styleUserList.Width(userListWidth).Height(m.viewport.Height).Render(userListSB.String())
+		
+		mainView := lipgloss.JoinHorizontal(lipgloss.Top, chatView, userListStr)
+		sb.WriteString(mainView)
+	} else {
+		sb.WriteString(chatView)
+	}
+	
 	sb.WriteString("\n")
 
 	// Input box

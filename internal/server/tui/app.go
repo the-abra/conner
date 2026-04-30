@@ -9,6 +9,7 @@ import (
 	"conner/internal/protocol"
 	"conner/internal/server"
 	"conner/internal/server/sysmon"
+
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -18,39 +19,39 @@ import (
 // ─── Theme ───────────────────────────────────────────────────────────────────
 
 var (
-	clrGreen    = lipgloss.Color("#00FF41")
-	clrDkGreen  = lipgloss.Color("#008F11")
-	clrGray     = lipgloss.Color("#888888")
-	clrDkGray   = lipgloss.Color("#222222")
-	clrWhite    = lipgloss.Color("#DDDDDD")
-	clrRed      = lipgloss.Color("#FF3333")
-	clrCyan     = lipgloss.Color("#00FFFF")
-	clrYellow   = lipgloss.Color("#FFD700")
+	clrBlue   = lipgloss.Color("#007BFF")
+	clrDkBlue = lipgloss.Color("#0056b3")
+	clrGray   = lipgloss.Color("#888888")
+	clrDkGray = lipgloss.Color("#222222")
+	clrWhite  = lipgloss.Color("#DDDDDD")
+	clrRed    = lipgloss.Color("#FF3333")
+	clrCyan   = lipgloss.Color("#00FFFF")
+	clrYellow = lipgloss.Color("#FFD700")
 
 	styleTitle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(clrGreen).
+			Foreground(clrBlue).
 			BorderBottom(true).
 			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(clrDkGreen).
+			BorderForeground(clrDkBlue).
 			MarginBottom(1)
 
 	styleActiveTab = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#000000")).
-			Background(clrGreen).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(clrBlue).
 			Padding(0, 2).
 			MarginRight(1)
 
 	styleInactiveTab = lipgloss.NewStyle().
-				Foreground(clrGreen).
+				Foreground(clrBlue).
 				Background(clrDkGray).
 				Padding(0, 2).
 				MarginRight(1)
 
 	styleInput = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(clrDkGreen).
+			BorderForeground(clrDkBlue).
 			Padding(0, 1)
 
 	styleStatus = lipgloss.NewStyle().
@@ -64,12 +65,12 @@ var (
 			Foreground(clrWhite)
 
 	styleFileSelected = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#000000")).
-				Background(clrRed).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(clrDkBlue).
 				Bold(true)
 
 	styleSysMsg = lipgloss.NewStyle().Foreground(clrCyan).Italic(true)
-	styleWL     = lipgloss.NewStyle().Foreground(clrGreen)
+	styleWL     = lipgloss.NewStyle().Foreground(clrBlue)
 	styleBL     = lipgloss.NewStyle().Foreground(clrRed)
 )
 
@@ -95,15 +96,16 @@ type Model struct {
 	height      int
 	input       textinput.Model
 	viewport    viewport.Model
-	filesCursor int            // cursor row in Files tab
+	filesCursor int // cursor row in Files tab
 	statusMsg   string
 	sysSnap     sysmon.Snapshot // cached system metrics
+	showHelp    bool
 }
 
 func InitialModel(s *server.Server) tea.Model {
 	ti := textinput.New()
 	ti.Placeholder = "/connect <user>  /block <user>  /kick <user>  /ann <msg>"
-	ti.PromptStyle = lipgloss.NewStyle().Foreground(clrGreen)
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(clrBlue)
 	ti.TextStyle = lipgloss.NewStyle().Foreground(clrWhite)
 	ti.Focus()
 
@@ -167,50 +169,94 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.srv.Running = false
 			return m, tea.Quit
 
+		case "esc":
+			if m.showHelp {
+				m.showHelp = false
+				return m, nil
+			}
+
 		case "tab":
 			val := m.input.Value()
-			if strings.HasPrefix(val, "/") {
-				cmds := []string{"/ann ", "/kick ", "/block ", "/unblock ", "/whitelist ", "/connect ", "/help"}
-				current := strings.Split(val, " ")[0]
-				
-				var matches []string
+			parts := strings.Split(val, " ")
+			currentWord := parts[len(parts)-1]
+
+			var matches []string
+
+			if len(parts) == 1 {
+				// Autocomplete commands
+				cmds := []string{"/ann ", "/kick ", "/block ", "/unblock ", "/whitelist ", "/connect ", "/help", "/op "}
 				for _, c := range cmds {
-					if strings.HasPrefix(c, current) {
+					// Match with or without slash
+					if strings.HasPrefix(c, currentWord) || strings.HasPrefix(c, "/"+currentWord) {
 						matches = append(matches, c)
 					}
 				}
-
-				if len(matches) > 0 {
-					found := -1
-					for i, match := range matches {
-						if match == current || (strings.HasSuffix(match, " ") && match == current+" ") {
-							found = i
-							break
+			} else if len(parts) == 2 {
+				// Autocomplete users
+				cmd := parts[0]
+				var users []*server.Client
+				switch cmd {
+				case "/connect", "/approve", "/whitelist":
+					// Suggest PENDING users
+					for _, c := range m.srv.ClientManager.GetAllClients() {
+						if c.State == "PENDING" {
+							users = append(users, c)
 						}
 					}
-					next := matches[(found+1)%len(matches)]
-					m.input.SetValue(next)
-					m.input.SetCursor(len(next))
-					break // Don't switch tabs if completing
+				case "/kick", "/block", "/blacklist":
+					// Suggest WHITELISTED and PENDING users
+					for _, c := range m.srv.ClientManager.GetAllClients() {
+						if c.State == "WHITELISTED" || c.State == "PENDING" {
+							users = append(users, c)
+						}
+					}
+				case "/op", "/unblock":
+					// Suggest WHITELISTED users
+					for _, c := range m.srv.ClientManager.GetAllClients() {
+						if c.State == "WHITELISTED" {
+							users = append(users, c)
+						}
+					}
+				}
+
+				for _, u := range users {
+					if strings.HasPrefix(u.Nickname, currentWord) {
+						matches = append(matches, u.Nickname)
+					}
 				}
 			}
-			// Fallthrough to tab switching
-			m.tab = (m.tab + 1) % len(tabNames)
-			m.filesCursor = 0
-			m.viewport.GotoTop()
+
+			if len(matches) > 0 {
+				found := -1
+				for i, match := range matches {
+					if match == currentWord {
+						found = i
+						break
+					}
+				}
+				next := matches[(found+1)%len(matches)]
+
+				// Rebuild the input value
+				parts[len(parts)-1] = next
+				newVal := strings.Join(parts, " ")
+				m.input.SetValue(newVal)
+				m.input.SetCursor(len(newVal))
+			}
 
 		case "shift+tab":
-			m.tab = (m.tab - 1 + len(tabNames)) % len(tabNames)
+			m.tab = (m.tab + 1) % len(tabNames)
 			m.filesCursor = 0
 			m.viewport.GotoTop()
 
 		case "up", "k":
 			if m.tab == tabFiles {
-				files := m.srv.GetMediaList()
 				if m.filesCursor > 0 {
 					m.filesCursor--
+					// Ensure viewport follows cursor
+					if m.filesCursor < m.viewport.YOffset {
+						m.viewport.SetYOffset(m.filesCursor)
+					}
 				}
-				_ = files
 			} else {
 				m.viewport, cmd = m.viewport.Update(msg)
 				cmds = append(cmds, cmd)
@@ -221,6 +267,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				files := m.srv.GetMediaList()
 				if m.filesCursor < len(files)-1 {
 					m.filesCursor++
+					// Ensure viewport follows cursor
+					if m.filesCursor >= m.viewport.YOffset+m.viewport.Height-4 {
+						m.viewport.SetYOffset(m.filesCursor - m.viewport.Height + 5)
+					}
 				}
 			} else {
 				m.viewport, cmd = m.viewport.Update(msg)
@@ -251,6 +301,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
+			if m.showHelp {
+				m.showHelp = false
+				return m, nil
+			}
 			val := strings.TrimSpace(m.input.Value())
 			if val == "" {
 				break
@@ -263,6 +317,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	m.input, cmd = m.input.Update(msg)
 	cmds = append(cmds, cmd)
+
+	// Final sync to ensure viewport has the latest content for the next frame
+	m.viewport.SetContent(m.renderTab())
 
 	return m, tea.Batch(cmds...)
 }
@@ -318,17 +375,25 @@ func (m *Model) executeAdminCommand(val string) {
 
 	case "/ann":
 		if len(parts) >= 2 {
-			annText := strings.Join(parts[1:], " ")
-			annMsg := protocol.CreateMessage(config.MsgTypeSystem,
-				"📢 [SERVER ANNOUNCEMENT]: "+annText, "SERVER")
-			// Broadcast to all active rooms
-			for _, state := range []string{"WHITELISTED", "BLACKLISTED"} {
-				m.srv.BroadcastToState(state, annMsg, "")
-			}
-			m.srv.Log("[ANN] " + annText)
-			m.srv.AddEvent("📢", "Announcement: "+annText)
-			m.statusMsg = "📢 Announced to all rooms"
+			msg := strings.Join(parts[1:], " ")
+			m.srv.BroadcastToState("WHITELISTED", protocol.CreateMessage(config.MsgTypeSystem, "📢 "+msg, "ADMIN"), "")
+			m.statusMsg = "✓ Announcement sent"
 		}
+
+	case "/op":
+		if len(parts) >= 2 {
+			target := m.srv.ClientManager.GetClientByNickname(parts[1])
+			if target != nil {
+				target.IsAdmin = true
+				m.srv.SendSystemMessage(target, "You have been granted admin privileges.")
+				m.statusMsg = "✓ Granted admin to " + parts[1]
+			} else {
+				m.statusMsg = "User not found: " + parts[1]
+			}
+		}
+
+	case "/help":
+		m.showHelp = true
 
 	case "/purge":
 		m.srv.DBManager.Clear()
@@ -349,6 +414,37 @@ func (m Model) View() string {
 		return "Loading CONNER Admin Panel..."
 	}
 
+	if m.showHelp {
+		help := `
+  CONNER ADMIN PANEL — Commands
+  ─────────────────────────────────────────────
+  /connect <nick>    Approve a pending user
+  /block <nick>      Move user to shadow room
+  /kick <nick>       Disconnect a user
+  /ann <msg>         Send global announcement
+  /op <nick>         Grant admin permissions
+  /purge             Clear all chat history
+  /help              Show this menu
+  
+  [Tab]              Auto-complete commands/users
+  [Shift+Tab]        Switch between dashboard tabs
+  [↑↓ / k j]         Scroll viewports / lists
+  [D / Del]          Delete file (in Files tab)
+  [Ctrl+C]           Exit Admin Panel
+  [ESC / Enter]      Close this menu
+`
+		// Use a double border for the help menu
+		styleHelpBox := lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(clrBlue).
+			Padding(1, 2).
+			Foreground(lipgloss.Color("#AAAAAA"))
+
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			styleHelpBox.Render(help))
+	}
+
 	var sb strings.Builder
 
 	// ── Tab bar ──────────────────────────────────────────────────────────────
@@ -367,8 +463,6 @@ func (m Model) View() string {
 	sb.WriteString(tabBarLine + "\n\n")
 
 	// ── Content ──────────────────────────────────────────────────────────────
-	content := m.renderTab()
-	m.viewport.SetContent(content)
 	sb.WriteString(m.viewport.View())
 	sb.WriteString("\n")
 
@@ -418,7 +512,7 @@ func (m Model) renderTab() string {
 		}
 
 		stat := func(label, val string) string {
-			return fmt.Sprintf("  %-18s %s\n", label, lipgloss.NewStyle().Foreground(clrGreen).Render(val))
+			return fmt.Sprintf("  %-18s %s\n", label, lipgloss.NewStyle().Foreground(clrBlue).Render(val))
 		}
 		left.WriteString(stat("Tor Address:", truncate(m.srv.Stats.TorAddress, colW-22)))
 		left.WriteString(stat("Uptime:", uptime.String()))
@@ -426,17 +520,19 @@ func (m Model) renderTab() string {
 		left.WriteString(stat("Messages Sent:", fmt.Sprintf("%d", m.srv.Stats.MessagesSent)))
 		left.WriteString(stat("Commands Executed:", fmt.Sprintf("%d", m.srv.Stats.CommandsExecuted)))
 		left.WriteString("\n")
-		left.WriteString(styleGray("  ── Active Clients ───────────────\n"))
+		left.WriteString(styleGray("  ── Active Clients ───────────────"))
+		left.WriteString("\n")
 		left.WriteString(fmt.Sprintf("  %-18s %s\n", "Whitelisted:",
-			lipgloss.NewStyle().Foreground(clrGreen).Render(fmt.Sprintf("%d", wl))))
+			lipgloss.NewStyle().Foreground(clrBlue).Render(fmt.Sprintf("%d", wl))))
 		left.WriteString(fmt.Sprintf("  %-18s %s\n", "Blacklisted:",
 			lipgloss.NewStyle().Foreground(clrRed).Render(fmt.Sprintf("%d", bl))))
 		left.WriteString(fmt.Sprintf("  %-18s %s\n", "Pending:",
 			lipgloss.NewStyle().Foreground(clrYellow).Render(fmt.Sprintf("%d", pend))))
 		left.WriteString("\n")
-		left.WriteString(styleGray("  ── Console Log ──────────────────\n"))
+		left.WriteString(styleGray("  ── Console Log ──────────────────"))
+		left.WriteString("\n")
 		logs := m.srv.ConsoleHistory
-		logStart := len(logs) - 20
+		logStart := len(logs) - 100
 		if logStart < 0 {
 			logStart = 0
 		}
@@ -453,7 +549,7 @@ func (m Model) renderTab() string {
 			right.WriteString(styleGray("  No events yet.\n"))
 		} else {
 			// Show last events that fit, newest at bottom
-			evStart := len(events) - 60
+			evStart := len(events) - 200
 			if evStart < 0 {
 				evStart = 0
 			}
@@ -470,12 +566,11 @@ func (m Model) renderTab() string {
 			Width(colW).
 			BorderLeft(true).
 			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(clrDkGreen).
+			BorderForeground(clrDkBlue).
 			PaddingLeft(1).
 			Render(right.String())
 
 		return lipgloss.JoinHorizontal(lipgloss.Top, leftStr, rightStr)
-
 
 	case tabWhitelist:
 		var sb strings.Builder
@@ -508,7 +603,7 @@ func (m Model) renderTab() string {
 			stateColor := clrGray
 			switch c.State {
 			case "WHITELISTED":
-				stateColor = clrGreen
+				stateColor = clrBlue
 			case "BLACKLISTED":
 				stateColor = clrRed
 			case "PENDING":
@@ -522,7 +617,6 @@ func (m Model) renderTab() string {
 			sb.WriteString(fmt.Sprintf("  %-18s %s %s%s\n", c.Nickname, stateStr, c.Address, admin))
 		}
 		return sb.String()
-
 	case tabFiles:
 		files := m.srv.GetMediaList()
 
@@ -537,11 +631,8 @@ func (m Model) renderTab() string {
 
 		var sb strings.Builder
 
-		// ── Header ───────────────────────────────────────────────────────────
 		if len(files) == 0 {
 			sb.WriteString(styleTitle.Render(" FILES ") + "\n\n")
-			// Single Render call avoids per-line width calculations that cause
-			// alignment drift when emoji (multi-byte) is present in the first line.
 			sb.WriteString(lipgloss.NewStyle().Foreground(clrGray).Italic(true).Render(
 				"  No files uploaded yet.\n"+
 					"  Files uploaded by clients are stored in RAM\n"+
@@ -550,106 +641,52 @@ func (m Model) renderTab() string {
 			return sb.String()
 		}
 
-		// Calculate total RAM used (base64 len × 3/4 = raw bytes)
-		var totalBytes int
-		for _, f := range files {
-			totalBytes += len(f.Data) * 3 / 4
-		}
-		totalStr := formatFileSize(totalBytes)
+		sb.WriteString(styleTitle.Render(fmt.Sprintf(" FILES (%d) AVAILABLE ", len(files))) + "\n")
 
-		header := fmt.Sprintf(" FILES  %s  ·  %d file(s)  ·  %s in RAM ",
-			lipgloss.NewStyle().Foreground(clrGray).Render(""),
-			len(files), totalStr)
-		sb.WriteString(styleTitle.Render(header) + "\n")
-
-		// ── Column header ─────────────────────────────────────────────────────
-		colID := 10
-		colName := 26
-		colUp := 14
+		// ── Column headers ───────────────────────────────────────────────────
+		colID := 12
+		colName := 30
+		colUp := 16
 		colSize := 10
+		colAge := 10
 
-		hdr := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %s",
-			colID, "ID",
-			colName, "Filename",
-			colUp, "Uploader",
-			colSize, "Size",
-			"Uploaded",
+		headers := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %-*s",
+			colID, "FILE ID",
+			colName, "FILENAME",
+			colUp, "UPLOADER",
+			colSize, "SIZE",
+			colAge, "AGE",
 		)
-		sb.WriteString(lipgloss.NewStyle().Foreground(clrDkGreen).Bold(true).Render(hdr) + "\n")
-		sb.WriteString(styleGray("  " + strings.Repeat("─", m.width-6) + "\n"))
+		sb.WriteString(lipgloss.NewStyle().Foreground(clrDkBlue).Bold(true).Render(headers) + "\n")
+		sb.WriteString(styleGray("  "+strings.Repeat("─", m.width-6)) + "\n")
 
 		// ── File rows ─────────────────────────────────────────────────────────
 		for i, f := range files {
-			sz := formatFileSize(len(f.Data) * 3 / 4)
+			sz := "REMOTE"
+			if f.Metadata != "" {
+				sz = f.Metadata
+			}
 			age := fileAge(f.UploadedAt)
 
-			row := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %s",
+			row := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %-*s",
 				colID, f.ID,
 				colName, truncate(f.Filename, colName),
 				colUp, truncate(f.Uploader, colUp),
 				colSize, sz,
-				age,
+				colAge, age,
 			)
 
+			style := lipgloss.NewStyle()
 			if i == m.filesCursor {
-				// highlighted row
-				sb.WriteString(lipgloss.NewStyle().
-					Background(clrDkGreen).
-					Foreground(lipgloss.Color("#000000")).
-					Bold(true).
-					Render(row) + "\n")
+				style = style.Background(clrDkBlue).Foreground(lipgloss.Color("#000000")).Bold(true)
+			} else if i%2 == 1 {
+				style = style.Foreground(lipgloss.Color("#AAAAAA"))
 			} else {
-				// alternating row dimming
-				style := lipgloss.NewStyle().Foreground(clrWhite)
-				if i%2 == 1 {
-					style = style.Foreground(clrGray)
-				}
-				sb.WriteString(style.Render(row) + "\n")
-			}
-		}
-
-		// ── Detail card for selected file ─────────────────────────────────────
-		if m.filesCursor < len(files) {
-			sel := files[m.filesCursor]
-			rawSize := len(sel.Data) * 3 / 4
-
-			sb.WriteString("\n")
-			sb.WriteString(styleGray("  " + strings.Repeat("─", m.width-6) + "\n"))
-
-			cardW := m.width - 8
-			if cardW < 40 {
-				cardW = 40
+				style = style.Foreground(clrWhite)
 			}
 
-			detail := fmt.Sprintf(
-				"  📄 %s\n"+
-					"  Uploader : %s\n"+
-					"  Size     : %s  (%d bytes raw)\n"+
-					"  Uploaded : %s\n"+
-					"  Download : /download %s <save-dir>",
-				lipgloss.NewStyle().Foreground(clrGreen).Bold(true).Render(sel.Filename),
-				lipgloss.NewStyle().Foreground(clrCyan).Render(sel.Uploader),
-				lipgloss.NewStyle().Foreground(clrYellow).Render(formatFileSize(rawSize)),
-				rawSize,
-				sel.UploadedAt.Format("2006-01-02 15:04:05"),
-				sel.ID,
-			)
-
-			card := lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(clrDkGreen).
-				Padding(0, 1).
-				Width(cardW).
-				Render(detail)
-
-			sb.WriteString(card + "\n")
+			sb.WriteString(style.Render(row) + "\n")
 		}
-
-		// ── Action bar ────────────────────────────────────────────────────────
-		sb.WriteString("\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(clrGray).Render(
-			"  [↑↓] navigate   [D/Del] delete   [Tab] switch tab\n"))
-
 		return sb.String()
 
 	case tabSystem:
@@ -662,16 +699,16 @@ func (m Model) renderTab() string {
 		sb.WriteString(styleTitle.Render(" SYSTEM MONITOR ") + "\n")
 
 		// ── Host Info ──────────────────────────────────────────────────────────
-		sb.WriteString(styleGray("  ── Host ──────────────────────────────────────────────\n"))
-		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Hostname:", lipgloss.NewStyle().Foreground(clrGreen).Render(snap.Hostname)))
+		sb.WriteString(styleGray("  ── Host ──────────────────────────────────────────────"))
+		sb.WriteString(fmt.Sprintf("\n  %-18s %s\n", "Hostname:", lipgloss.NewStyle().Foreground(clrBlue).Render(snap.Hostname)))
 		sb.WriteString(fmt.Sprintf("  %-18s %s / %s\n", "Platform:", snap.OS, snap.Arch))
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Go Version:", snap.GoVersion))
 		sb.WriteString("\n")
 
 		// ── Load ───────────────────────────────────────────────────────────────
-		sb.WriteString(styleGray("  ── CPU / Load ──────────────────────────────────────────\n"))
-		sb.WriteString(fmt.Sprintf("  %-18s %d\n", "CPU Cores:", snap.NumCPU))
-		loadColor := clrGreen
+		sb.WriteString(styleGray("  ── CPU / Load ──────────────────────────────────────────"))
+		sb.WriteString(fmt.Sprintf("\n  %-18s %d\n", "CPU Cores:", snap.NumCPU))
+		loadColor := clrBlue
 		if snap.LoadAvg1 > float64(snap.NumCPU)*0.8 {
 			loadColor = clrRed
 		} else if snap.LoadAvg1 > float64(snap.NumCPU)*0.5 {
@@ -684,7 +721,7 @@ func (m Model) renderTab() string {
 
 		// ── Memory ────────────────────────────────────────────────────────────
 		memPct := sysmon.MemPercent(snap)
-		memColor := clrGreen
+		memColor := clrBlue
 		if memPct > 85 {
 			memColor = clrRed
 		} else if memPct > 65 {
@@ -693,8 +730,8 @@ func (m Model) renderTab() string {
 		barW := 30
 		bar := lipgloss.NewStyle().Foreground(memColor).Render(sysmon.ProgressBar(memPct, barW))
 
-		sb.WriteString(styleGray("  ── Memory ────────────────────────────────────────────────\n"))
-		sb.WriteString(fmt.Sprintf("  %-18s %s  %s / %s  (%.1f%%)\n",
+		sb.WriteString(styleGray("  ── Memory ────────────────────────────────────────────────"))
+		sb.WriteString(fmt.Sprintf("\n  %-18s %s  %s / %s  (%.1f%%)\n",
 			"RAM:",
 			bar,
 			sysmon.FormatKB(snap.MemUsedKB),
@@ -716,24 +753,20 @@ func (m Model) renderTab() string {
 		sb.WriteString("\n")
 
 		// ── Go Runtime ────────────────────────────────────────────────────────
-		sb.WriteString(styleGray("  ── Go Runtime ───────────────────────────────────────────\n"))
-		sb.WriteString(fmt.Sprintf("  %-18s %d\n", "Goroutines:", snap.Goroutines))
+		sb.WriteString(styleGray("  ── Go Runtime ───────────────────────────────────────────"))
+		sb.WriteString(fmt.Sprintf("\n  %-18s %d\n", "Goroutines:", snap.Goroutines))
 		sb.WriteString(fmt.Sprintf("  %-18s %.2f MB\n", "Heap Alloc:", snap.GoAllocMB))
 		sb.WriteString(fmt.Sprintf("  %-18s %.2f MB\n", "Sys Memory:", snap.GoSysMB))
 		sb.WriteString(fmt.Sprintf("  %-18s %d\n", "GC Cycles:", snap.GoNumGC))
 		sb.WriteString("\n")
 
 		// ── Network ───────────────────────────────────────────────────────────
-		sb.WriteString(styleGray("  ── Network ─────────────────────────────────────────────\n"))
+		sb.WriteString(styleGray("  ── Network ─────────────────────────────────────────────"))
 		if len(snap.NetIfaces) == 0 {
-			sb.WriteString(styleGray("  No network interfaces detected.\n"))
+			sb.WriteString(styleGray("\n  No network interfaces detected.\n"))
 		}
 		for _, iface := range snap.NetIfaces {
-			sb.WriteString(fmt.Sprintf("  %-10s  ↓ %-14s  ↑ %s\n",
-				iface.Name,
-				sysmon.FormatBytes(iface.RxBytes),
-				sysmon.FormatBytes(iface.TxBytes),
-			))
+			sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Interface:", iface.Name))
 		}
 		sb.WriteString(fmt.Sprintf("  %-18s ESTABLISHED:%d  LISTEN:%d  TIME_WAIT:%d\n",
 			"TCP:",
@@ -744,18 +777,19 @@ func (m Model) renderTab() string {
 		sb.WriteString("\n")
 
 		// ── Services ──────────────────────────────────────────────────────────
-		sb.WriteString(styleGray("  ── Services ────────────────────────────────────────────\n"))
+		sb.WriteString(styleGray("  ── Services ────────────────────────────────────────────"))
+		sb.WriteString("\n")
 		torStatus := lipgloss.NewStyle().Foreground(clrRed).Render("● STOPPED")
 		if snap.TorRunning {
-			torStatus = lipgloss.NewStyle().Foreground(clrGreen).Render("● RUNNING")
+			torStatus = lipgloss.NewStyle().Foreground(clrBlue).Render("● RUNNING")
 		}
 		nginxStatus := lipgloss.NewStyle().Foreground(clrRed).Render("● STOPPED")
 		if snap.NginxRunning {
-			nginxStatus = lipgloss.NewStyle().Foreground(clrGreen).Render("● RUNNING")
+			nginxStatus = lipgloss.NewStyle().Foreground(clrBlue).Render("● RUNNING")
 		}
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Tor:", torStatus))
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "NGINX:", nginxStatus))
-		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Conner Server:", lipgloss.NewStyle().Foreground(clrGreen).Render("● RUNNING")))
+		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Conner Server:", lipgloss.NewStyle().Foreground(clrBlue).Render("● RUNNING")))
 		sb.WriteString("\n")
 		sb.WriteString(styleGray(fmt.Sprintf("  Last updated: %s\n", snap.CollectedAt.Format("15:04:05"))))
 		return sb.String()

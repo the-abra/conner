@@ -17,11 +17,11 @@ import (
 
 // MediaEntry stores metadata about uploaded files
 type MediaEntry struct {
-	ID        string
-	Filename  string
-	Data      string // base64 encoded tar
-	Uploader  string
+	ID         string
+	Filename   string
+	Uploader   string
 	UploadedAt time.Time
+	Metadata   string // client address or other info
 }
 
 // EventEntry is a single real-time notification in the dashboard feed.
@@ -358,30 +358,50 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return
 	}
 
-	if msg.Type == config.MsgTypeMediaData {
-		parts := strings.SplitN(msg.Content, "|", 2)
-		if len(parts) == 2 {
-			rawKey := crypto.GenerateRandomKey()[:6]
-			id := crypto.Base64Encode(rawKey)
-			// Sanitize id to be URL/message safe
-			id = strings.ReplaceAll(id, "/", "x")
-			id = strings.ReplaceAll(id, "+", "y")
-			id = strings.ReplaceAll(id, "=", "")
-
+	if msg.Type == config.MsgTypeMediaRegister {
+		parts := strings.SplitN(msg.Content, "|", 3)
+		if len(parts) == 3 {
+			id := parts[1]
+			filename := parts[0]
+			metadata := parts[2]
+			
 			entry := &MediaEntry{
 				ID:         id,
-				Filename:   parts[0],
-				Data:       parts[1],
+				Filename:   filename,
 				Uploader:   client.Nickname,
 				UploadedAt: time.Now(),
+				Metadata:   metadata,
 			}
 			s.MediaDB.Store(id, entry)
-
-			info := fmt.Sprintf("[FILE] %s uploaded: %s (ID: %s) — /download %s <dir>", client.Nickname, parts[0], id, id)
+			
+			info := fmt.Sprintf("[FILE] %s shared: %s (ID: %s) — /download %s", client.Nickname, filename, id, id)
 			bmsg := protocol.CreateMessage(config.MsgTypeMediaInfo, info, "SERVER")
 			s.BroadcastToState(client.State, bmsg, "")
-			s.Log(fmt.Sprintf("[MEDIA] %s uploaded %s -> %s", client.Nickname, parts[0], id))
-			s.AddEvent("📎", fmt.Sprintf("%s uploaded: %s (ID: %s)", client.Nickname, parts[0], id))
+			s.Log(fmt.Sprintf("[MEDIA] %s registered %s -> %s", client.Nickname, filename, id))
+			s.AddEvent("📎", fmt.Sprintf("%s shared: %s (ID: %s)", client.Nickname, filename, id))
+		}
+		return
+	}
+
+	if msg.Type == config.MsgTypeMediaData {
+		parts := strings.SplitN(msg.Content, "|", 3)
+		if len(parts) == 3 {
+			filename := parts[0]
+			data := parts[1]
+			targetNick := parts[2]
+			
+			target := s.ClientManager.GetClientByNickname(targetNick)
+			if target != nil {
+				resp := protocol.CreateMessage(config.MsgTypeMediaData, filename+"|"+data, "SERVER")
+				msgJSON, _ := resp.ToJSON()
+				enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
+				select {
+				case target.SendChan <- crypto.Base64Encode(enc):
+					s.Log(fmt.Sprintf("[PUSH] Forwarded %s to %s", filename, targetNick))
+					s.AddEvent("⬇️", fmt.Sprintf("%s downloaded: %s", targetNick, filename))
+				default:
+				}
+			}
 		}
 		return
 	}
@@ -390,14 +410,24 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		val, ok := s.MediaDB.Load(msg.Content)
 		if ok {
 			entry := val.(*MediaEntry)
-			resp := protocol.CreateMessage(config.MsgTypeMediaData, entry.Filename+"|"+entry.Data, "SERVER")
-			msgJSON, _ := resp.ToJSON()
-			enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
-			select {
-			case client.SendChan <- crypto.Base64Encode(enc):
-			default:
+			// Find the owner
+			owner := s.ClientManager.GetClientByNickname(entry.Uploader)
+			if owner != nil {
+				// Request the file from the owner
+				// We send a system message or a special type to the owner
+				// For simplicity, let's reuse MsgTypeDownloadReq but with the file ID
+				req := protocol.CreateMessage(config.MsgTypeDownloadReq, entry.Filename+"|"+msg.Sender, "SERVER")
+				reqJSON, _ := req.ToJSON()
+				enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(reqJSON))
+				select {
+				case owner.SendChan <- crypto.Base64Encode(enc):
+					s.Log(fmt.Sprintf("[PULL] Requested %s from %s for %s", entry.Filename, owner.Nickname, client.Nickname))
+				default:
+					s.SendSystemMessage(client, "Owner is busy, try again later.")
+				}
+			} else {
+				s.SendSystemMessage(client, "Owner is offline.")
 			}
-			s.AddEvent("⬇️", fmt.Sprintf("%s downloaded: %s", client.Nickname, entry.Filename))
 		} else {
 			s.SendSystemMessage(client, "File not found or expired.")
 		}
@@ -497,6 +527,7 @@ func (s *Server) handleCommand(client *Client, content string) {
 				s.SendSystemMessage(target, "You have been approved by an admin.")
 				s.Log(fmt.Sprintf("Admin %s approved %s", client.Nickname, parts[1]))
 				s.AddEvent("✅", fmt.Sprintf("%s approved %s → WHITELIST", client.Nickname, parts[1]))
+				s.BroadcastUserList()
 			}
 		}
 
@@ -514,6 +545,7 @@ func (s *Server) handleCommand(client *Client, content string) {
 			s.SendSystemMessage(client, parts[1]+" moved to shadow room and blacklisted.")
 			s.Log(fmt.Sprintf("Admin %s blacklisted %s (shadow)", client.Nickname, parts[1]))
 			s.AddEvent("⛔", fmt.Sprintf("%s blacklisted %s → SHADOW ROOM", client.Nickname, parts[1]))
+			s.BroadcastUserList()
 		}
 
 	case "/kick":
@@ -524,9 +556,22 @@ func (s *Server) handleCommand(client *Client, content string) {
 				s.removeClient(target)
 				s.SendSystemMessage(client, parts[1]+" has been kicked.")
 				s.Log(fmt.Sprintf("Admin %s kicked %s", client.Nickname, parts[1]))
+				s.BroadcastUserList()
 			}
 		}
 	}
+}
+
+func (s *Server) BroadcastUserList() {
+	var users []string
+	for _, c := range s.ClientManager.GetAllClients() {
+		if c.State == "WHITELISTED" {
+			users = append(users, c.Nickname)
+		}
+	}
+	userList := strings.Join(users, ",")
+	msg := protocol.CreateMessage(config.MsgTypeUserList, userList, "SERVER")
+	s.BroadcastToState("WHITELISTED", msg, "")
 }
 
 func (s *Server) BroadcastToState(state string, msg protocol.ChatMessage, excludeID string) {

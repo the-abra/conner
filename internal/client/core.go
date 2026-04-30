@@ -3,7 +3,9 @@ package client
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -143,8 +145,43 @@ func Connect(nickname, address string) (*Client, error) {
 
 	go client.readPump()
 	go client.writePump()
+	go client.WatchUploads()
 
 	return client, nil
+}
+
+func (c *Client) WatchUploads() {
+	uploadDir := "upload"
+	os.MkdirAll(uploadDir, 0750)
+	
+	knownFiles := make(map[string]bool)
+	
+	ticker := time.NewTicker(5 * time.Second)
+	for range ticker.C {
+		entries, err := os.ReadDir(uploadDir)
+		if err != nil {
+			continue
+		}
+		
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			
+			if !knownFiles[entry.Name()] {
+				// New file detected!
+				knownFiles[entry.Name()] = true
+				
+				// In a real scenario, we'd generate a unique ID. 
+				// For now, use filename as ID for simplicity or generate a hash.
+				id := entry.Name()
+				
+				// Declare to server
+				regMsg := protocol.CreateMessage(config.MsgTypeMediaRegister, entry.Name()+"|"+id+"|"+"local-address", "SYSTEM")
+				c.SendChan <- regMsg
+			}
+		}
+	}
 }
 
 func (c *Client) readPump() {
@@ -188,6 +225,25 @@ func (c *Client) readPump() {
 
 		msg, err := protocol.FromJSON(string(dec))
 		if err != nil {
+			continue
+		}
+
+		if msg.Type == config.MsgTypeDownloadReq {
+			// Server is requesting a file from us for another user
+			parts := strings.SplitN(msg.Content, "|", 2)
+			if len(parts) == 2 {
+				filename := parts[0]
+				requester := parts[1]
+				
+				// Read from upload/
+				path := filepath.Join("upload", filename)
+				fn, b64, err := CreateMediaTarBase64(path)
+				if err == nil {
+					// Send back as MediaData with requester info
+					resp := protocol.CreateMessage(config.MsgTypeMediaData, fn+"|"+b64+"|"+requester, "SYSTEM")
+					c.SendChan <- resp
+				}
+			}
 			continue
 		}
 

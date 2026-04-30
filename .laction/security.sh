@@ -2,12 +2,24 @@
 # .laction/security.sh — gosec Scan (errors only)
 set -e
 
-apk add --no-cache gcc musl-dev git >/dev/null 2>&1 || true
-go mod download >/dev/null 2>&1
-go install github.com/securego/gosec/v2/cmd/gosec@latest >/dev/null 2>&1
+# Load shared setup
+. "$(dirname "$0")/setup.sh"
 
-# gosec: only show severity HIGH/MEDIUM findings; suppress info noise
-gosec -exclude=G204,G304 -severity medium ./... 2>&1 \
-    | grep -E "^\[" >&2 || true
+log_info "Starting security scan with gosec..."
 
+# Install gosec only if not already in PATH
+if ! command -v gosec >/dev/null 2>&1; then
+    log_info "Installing gosec..."
+    apk add gosec >/dev/null 2>&1
+fi
 
+# Run gosec
+# -exclude=G204,G304: matched existing suppression
+# -severity medium: show medium and high
+log_info "Running gosec scan..."
+if ! gosec -exclude=G204,G304 -severity medium ./... 2>&1 | grep -E "^\[" >&2; then
+    # No findings or grep didn't find anything (which is GOOD)
+    log_success "No high/medium severity security issues found."
+else
+    log_warn "Security findings detected (see above)."
+fi
