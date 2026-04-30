@@ -1,0 +1,41 @@
+# ─── Compiled Binaries ─────────────────────────────────────────────────────────
+bin/
+main
+conner-server
+conner-client
+conner-server-*
+conner-client-*
+*.exe
+*.out
+
+# ─── Go Build Cache ────────────────────────────────────────────────────────────
+/tmp/
+
+# ─── Tor Hidden Service Keys ───────────────────────────────────────────────────
+# Never commit private onion service keys
+hostname
+private_key
+hs_ed25519_secret_key
+hs_ed25519_public_key
+
+# ─── Runtime / Ephemeral Files ─────────────────────────────────────────────────
+*.log
+*.pid
+*.sock
+*.db
+
+# ─── IDE & OS ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Test Artifacts ────────────────────────────────────────────────────────────
+coverage.out
+coverage.html
+
+# ─── Downloads directory (client-side media extraction) ────────────────────────
+downloads/
