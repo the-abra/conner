@@ -19,39 +19,38 @@ import (
 // ─── Theme ───────────────────────────────────────────────────────────────────
 
 var (
-	clrBlue   = lipgloss.Color("#007BFF")
-	clrDkBlue = lipgloss.Color("#0056b3")
-	clrGray   = lipgloss.Color("#888888")
-	clrDkGray = lipgloss.Color("#222222")
-	clrWhite  = lipgloss.Color("#DDDDDD")
-	clrRed    = lipgloss.Color("#FF3333")
-	clrCyan   = lipgloss.Color("#00FFFF")
-	clrYellow = lipgloss.Color("#FFD700")
+	clrWhite   = lipgloss.Color("#FFFFFF")
+	clrDkWhite = lipgloss.Color("#AAAAAA")
+	clrGray    = lipgloss.Color("#888888")
+	clrDkGray  = lipgloss.Color("#222222")
+	clrRed     = lipgloss.Color("#FF3333")
+	clrCyan    = lipgloss.Color("#FFFFFF") // White accent
+	clrYellow  = lipgloss.Color("#FFD700")
 
 	styleTitle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(clrBlue).
+			Foreground(clrWhite).
 			BorderBottom(true).
 			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(clrDkBlue).
+			BorderForeground(clrDkWhite).
 			MarginBottom(1)
 
 	styleActiveTab = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(clrBlue).
+			Foreground(lipgloss.Color("#000000")).
+			Background(clrWhite).
 			Padding(0, 2).
 			MarginRight(1)
 
 	styleInactiveTab = lipgloss.NewStyle().
-				Foreground(clrBlue).
+				Foreground(clrWhite).
 				Background(clrDkGray).
 				Padding(0, 2).
 				MarginRight(1)
 
 	styleInput = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(clrDkBlue).
+			BorderForeground(clrWhite).
 			Padding(0, 1)
 
 	styleStatus = lipgloss.NewStyle().
@@ -65,12 +64,12 @@ var (
 			Foreground(clrWhite)
 
 	styleFileSelected = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FFFFFF")).
-				Background(clrDkBlue).
+				Foreground(lipgloss.Color("#000000")).
+				Background(clrWhite).
 				Bold(true)
 
-	styleSysMsg = lipgloss.NewStyle().Foreground(clrCyan).Italic(true)
-	styleWL     = lipgloss.NewStyle().Foreground(clrBlue)
+	styleSysMsg = lipgloss.NewStyle().Foreground(clrWhite).Italic(true)
+	styleWL     = lipgloss.NewStyle().Foreground(clrWhite)
 	styleBL     = lipgloss.NewStyle().Foreground(clrRed)
 )
 
@@ -113,7 +112,7 @@ func tick() tea.Cmd {
 func InitialModel(s *server.Server) tea.Model {
 	ti := textinput.New()
 	ti.Placeholder = "/connect <user>  /block <user>  /kick <user>  /ann <msg>"
-	ti.PromptStyle = lipgloss.NewStyle().Foreground(clrBlue)
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(clrWhite)
 	ti.TextStyle = lipgloss.NewStyle().Foreground(clrWhite)
 	ti.Focus()
 
@@ -375,7 +374,9 @@ func (m *Model) executeAdminCommand(val string) {
 	case "/ann":
 		if len(parts) >= 2 {
 			msg := strings.Join(parts[1:], " ")
-			m.srv.BroadcastToState("WHITELISTED", protocol.CreateMessage(config.MsgTypeSystem, "📢 "+msg, "ADMIN"), "")
+			fullText := "📢 " + msg
+			m.srv.DBManager.SaveMessage(config.MsgTypeSystem, fullText, "ADMIN")
+			m.srv.BroadcastToState("WHITELISTED", protocol.CreateMessage(config.MsgTypeSystem, fullText, "ADMIN"), "")
 			m.statusMsg = "✓ Announcement sent"
 		}
 
@@ -435,7 +436,7 @@ func (m Model) View() string {
 		// Use a double border for the help menu
 		styleHelpBox := lipgloss.NewStyle().
 			Border(lipgloss.DoubleBorder()).
-			BorderForeground(clrBlue).
+			BorderForeground(clrWhite).
 			Padding(1, 2).
 			Foreground(lipgloss.Color("#AAAAAA"))
 
@@ -511,7 +512,7 @@ func (m Model) renderTab() string {
 		}
 
 		stat := func(label, val string) string {
-			return fmt.Sprintf("  %-18s %s\n", label, lipgloss.NewStyle().Foreground(clrBlue).Render(val))
+			return fmt.Sprintf("  %-18s %s\n", label, lipgloss.NewStyle().Foreground(clrWhite).Render(val))
 		}
 		left.WriteString(stat("Tor Address:", truncate(m.srv.Stats.TorAddress, colW-22)))
 		left.WriteString(stat("Uptime:", uptime.String()))
@@ -522,7 +523,7 @@ func (m Model) renderTab() string {
 		left.WriteString(styleGray("  ── Active Clients ───────────────"))
 		left.WriteString("\n")
 		left.WriteString(fmt.Sprintf("  %-18s %s\n", "Whitelisted:",
-			lipgloss.NewStyle().Foreground(clrBlue).Render(fmt.Sprintf("%d", wl))))
+			lipgloss.NewStyle().Foreground(clrWhite).Render(fmt.Sprintf("%d", wl))))
 		left.WriteString(fmt.Sprintf("  %-18s %s\n", "Blacklisted:",
 			lipgloss.NewStyle().Foreground(clrRed).Render(fmt.Sprintf("%d", bl))))
 		left.WriteString(fmt.Sprintf("  %-18s %s\n", "Pending:",
@@ -565,7 +566,7 @@ func (m Model) renderTab() string {
 			Width(colW).
 			BorderLeft(true).
 			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(clrDkBlue).
+			BorderForeground(clrDkWhite).
 			PaddingLeft(1).
 			Render(right.String())
 
@@ -584,7 +585,7 @@ func (m Model) renderTab() string {
 	case tabBlacklist:
 		var sb strings.Builder
 		sb.WriteString(styleTitle.Render(" BLOCKED IDENTITIES / NICKNAMES ") + "\n")
-		sb.WriteString(styleGray("  Active blocks that prevent reconnection:\n\n"))
+		sb.WriteString(styleGray("  Active blocks that prevent reconnection:\n"))
 		for _, b := range m.srv.GetBlockedList() {
 			sb.WriteString("  " + styleBL.Render("⛔") + " " + b + "\n")
 		}
@@ -601,7 +602,7 @@ func (m Model) renderTab() string {
 			stateColor := clrGray
 			switch c.State {
 			case "WHITELISTED":
-				stateColor = clrBlue
+				stateColor = clrWhite
 			case "BLACKLISTED":
 				stateColor = clrRed
 			case "PENDING":
@@ -655,7 +656,7 @@ func (m Model) renderTab() string {
 			colSize, "SIZE",
 			colAge, "AGE",
 		)
-		sb.WriteString(lipgloss.NewStyle().Foreground(clrDkBlue).Bold(true).Render(headers) + "\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(clrDkWhite).Bold(true).Render(headers) + "\n")
 		sb.WriteString(styleGray("  "+strings.Repeat("─", m.width-6)) + "\n")
 
 		// ── File rows ─────────────────────────────────────────────────────────
@@ -676,7 +677,7 @@ func (m Model) renderTab() string {
 
 			style := lipgloss.NewStyle()
 			if i == m.filesCursor {
-				style = style.Background(clrDkBlue).Foreground(lipgloss.Color("#000000")).Bold(true)
+				style = style.Background(clrDkWhite).Foreground(lipgloss.Color("#000000")).Bold(true)
 			} else if i%2 == 1 {
 				style = style.Foreground(lipgloss.Color("#AAAAAA"))
 			} else {
@@ -698,7 +699,7 @@ func (m Model) renderTab() string {
 
 		// ── Host Info ──────────────────────────────────────────────────────────
 		sb.WriteString(styleGray("  ── Host ──────────────────────────────────────────────"))
-		sb.WriteString(fmt.Sprintf("\n  %-18s %s\n", "Hostname:", lipgloss.NewStyle().Foreground(clrBlue).Render(snap.Hostname)))
+		sb.WriteString(fmt.Sprintf("\n  %-18s %s\n", "Hostname:", lipgloss.NewStyle().Foreground(clrWhite).Render(snap.Hostname)))
 		sb.WriteString(fmt.Sprintf("  %-18s %s / %s\n", "Platform:", snap.OS, snap.Arch))
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Go Version:", snap.GoVersion))
 		sb.WriteString("\n")
@@ -706,7 +707,7 @@ func (m Model) renderTab() string {
 		// ── Load ───────────────────────────────────────────────────────────────
 		sb.WriteString(styleGray("  ── CPU / Load ──────────────────────────────────────────"))
 		sb.WriteString(fmt.Sprintf("\n  %-18s %d\n", "CPU Cores:", snap.NumCPU))
-		loadColor := clrBlue
+		loadColor := clrWhite
 		if snap.LoadAvg1 > float64(snap.NumCPU)*0.8 {
 			loadColor = clrRed
 		} else if snap.LoadAvg1 > float64(snap.NumCPU)*0.5 {
@@ -719,7 +720,7 @@ func (m Model) renderTab() string {
 
 		// ── Memory ────────────────────────────────────────────────────────────
 		memPct := sysmon.MemPercent(snap)
-		memColor := clrBlue
+		memColor := clrWhite
 		if memPct > 85 {
 			memColor = clrRed
 		} else if memPct > 65 {
@@ -780,15 +781,15 @@ func (m Model) renderTab() string {
 		sb.WriteString("\n")
 		torStatus := lipgloss.NewStyle().Foreground(clrRed).Render("● STOPPED")
 		if snap.TorRunning {
-			torStatus = lipgloss.NewStyle().Foreground(clrBlue).Render("● RUNNING")
+			torStatus = lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")
 		}
 		nginxStatus := lipgloss.NewStyle().Foreground(clrRed).Render("● STOPPED")
 		if snap.NginxRunning {
-			nginxStatus = lipgloss.NewStyle().Foreground(clrBlue).Render("● RUNNING")
+			nginxStatus = lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")
 		}
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Tor:", torStatus))
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "NGINX:", nginxStatus))
-		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Conner Server:", lipgloss.NewStyle().Foreground(clrBlue).Render("● RUNNING")))
+		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Conner Server:", lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")))
 		sb.WriteString("\n")
 		sb.WriteString(styleGray(fmt.Sprintf("  Last updated: %s\n", snap.CollectedAt.Format("15:04:05"))))
 		return sb.String()

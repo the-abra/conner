@@ -18,6 +18,8 @@ import (
 
 const torSOCKS5 = "127.0.0.1:9050"
 
+var ErrBanned = fmt.Errorf("You are banned from this server")
+
 // isTorRunning probes the SOCKS5 port without sending any data.
 func isTorRunning() bool {
 	c, err := net.DialTimeout("tcp", torSOCKS5, 2*time.Second)
@@ -64,6 +66,7 @@ type Client struct {
 	SendChan           chan protocol.ChatMessage
 	UpdateChan         chan protocol.ChatMessage // typed messages for rich TUI rendering
 	PendingDownloadDir chan string               // TUI pushes destDir before sending DOWNLOAD_REQ
+	sharedFiles        map[string]string         // filename -> absolute path
 }
 
 func Connect(nickname, address string) (*Client, error) {
@@ -99,10 +102,22 @@ func Connect(nickname, address string) (*Client, error) {
 	// 1. Receive KEY_EXCHANGE from server
 	payload, err := protocol.ReadFrame(conn)
 	if err != nil {
-		return nil, fmt.Errorf("handshake: KEY_EXCHANGE read failed: %w", err)
+		conn.Close()
+		return nil, fmt.Errorf("handshake: read failed: %w", err)
 	}
+
 	line := string(payload)
+	if strings.HasPrefix(line, "ERROR:") {
+		errStr := strings.TrimPrefix(line, "ERROR:")
+		conn.Close()
+		if strings.Contains(strings.ToLower(errStr), "ban") {
+			return nil, ErrBanned
+		}
+		return nil, fmt.Errorf("server error: %s", errStr)
+	}
+
 	if !strings.HasPrefix(line, "KEY_EXCHANGE:") {
+		conn.Close()
 		return nil, fmt.Errorf("handshake: expected KEY_EXCHANGE, got: %s", line)
 	}
 	serverPub, _ := crypto.Base64Decode(strings.TrimSpace(strings.Split(line, ":")[1]))
@@ -150,47 +165,32 @@ func Connect(nickname, address string) (*Client, error) {
 		SendChan:           make(chan protocol.ChatMessage, 10),
 		UpdateChan:         make(chan protocol.ChatMessage, 200),
 		PendingDownloadDir: make(chan string, 10), // buffered so TUI never blocks
+		sharedFiles:        make(map[string]string),
 	}
 
 	go client.readPump()
 	go client.writePump()
-	go client.WatchUploads()
 
 	return client, nil
 }
 
-func (c *Client) WatchUploads() {
-	uploadDir := "upload"
-	os.MkdirAll(uploadDir, 0777) // #nosec G301
-	
-	knownFiles := make(map[string]bool)
-	
-	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		entries, err := os.ReadDir(uploadDir)
-		if err != nil {
-			continue
-		}
-		
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			
-			if !knownFiles[entry.Name()] {
-				// New file detected!
-				knownFiles[entry.Name()] = true
-				
-				// In a real scenario, we'd generate a unique ID. 
-				// For now, use filename as ID for simplicity or generate a hash.
-				id := entry.Name()
-				
-				// Declare to server
-				regMsg := protocol.CreateMessage(config.MsgTypeMediaRegister, entry.Name()+"|"+id+"|"+"local-address", "SYSTEM")
-				c.SendChan <- regMsg
-			}
-		}
+func (c *Client) RegisterFile(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
 	}
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return err
+	}
+
+	name := info.Name()
+	c.sharedFiles[name] = absPath
+
+	// Declare to server: filename | uniqueID (using name for now) | address (server fills this)
+	regMsg := protocol.CreateMessage(config.MsgTypeMediaRegister, name+"|"+name+"|"+"local", "SYSTEM")
+	c.SendChan <- regMsg
+	return nil
 }
 
 func (c *Client) readPump() {
@@ -244,30 +244,30 @@ func (c *Client) readPump() {
 				filename := parts[0]
 				requester := parts[1]
 				
-				// Read from upload/
-				path := filepath.Join("upload", filename)
-				fn, b64, err := CreateMediaTarBase64(path)
-				if err == nil {
-					// Send back as MediaData with requester info
-					resp := protocol.CreateMessage(config.MsgTypeMediaData, fn+"|"+b64+"|"+requester, "SYSTEM")
-					c.SendChan <- resp
+				path, ok := c.sharedFiles[filename]
+				if ok {
+					fn, b64, err := CreateMediaTarBase64(path)
+					if err == nil {
+						// Send back as MediaData with requester info
+						resp := protocol.CreateMessage(config.MsgTypeMediaData, fn+"|"+b64+"|"+requester, "SYSTEM")
+						c.SendChan <- resp
+					}
 				}
 			}
 			continue
 		}
 
 		if msg.Type == config.MsgTypeMediaData {
-			parts := strings.SplitN(msg.Content, "|", 2)
-			if len(parts) == 2 {
-				// Use the dir the TUI pushed for this request;
-				// fall back to "downloads" if nothing was queued.
+			parts := strings.SplitN(msg.Content, "|", 3)
+			if len(parts) >= 2 {
+				b64Data := parts[1]
 				destDir := "downloads"
 				select {
 				case d := <-c.PendingDownloadDir:
 					destDir = d
 				default:
 				}
-				savedPath, extractErr := ExtractMediaTarBase64(parts[1], destDir)
+				savedPath, extractErr := ExtractMediaTarBase64(b64Data, destDir)
 				if extractErr == nil {
 					c.sendUpdate(protocol.ChatMessage{
 						Type:    config.MsgTypeSystem,

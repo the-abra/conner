@@ -43,8 +43,8 @@ type Server struct {
 	ConsoleHistory    []string
 	Stats             ServerStats
 	EventLog          []EventEntry // ring buffer of real-time notifications
-	BlacklistMap      map[string]bool
-	WhitelistMap      map[string]bool
+	BlacklistMap      map[string]string // Identity -> Nickname (Metadata)
+	WhitelistMap      map[string]bool   // Identity -> bool
 }
 
 type ServerStats struct {
@@ -80,26 +80,22 @@ func (s *Server) ApproveClient(nickname string) bool {
 
 func (s *Server) BlockClient(nickname string) bool {
 	target := s.ClientManager.GetClientByNickname(nickname)
-	s.mu.Lock()
-	s.BlacklistMap[nickname] = true
-	if target != nil {
-		s.BlacklistMap[target.Identity] = true
-		delete(s.WhitelistMap, target.Identity)
+	if target == nil {
+		return false
 	}
+
+	s.mu.Lock()
+	s.BlacklistMap[target.Identity] = target.Nickname
+	delete(s.WhitelistMap, target.Identity)
 	s.mu.Unlock()
 
-	if target != nil {
-		s.SendSystemMessage(target, "⚡ You have been blocked from the server.")
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			s.RemoveClient(target)
-		}()
-		s.Log("Admin blocked and disconnected: " + nickname)
-		s.AddEvent("⛔", "Admin blocked "+nickname)
-	} else {
-		s.Log("Admin blacklisted (nickname only): " + nickname)
-		s.AddEvent("⛔", "Admin blacklisted "+nickname)
-	}
+	s.SendSystemMessage(target, "⚡ You have been blocked from the server.")
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		s.RemoveClient(target)
+	}()
+	s.Log("Admin blocked and disconnected: " + nickname)
+	s.AddEvent("⛔", "Admin blocked "+nickname)
 	s.BroadcastUserList()
 	return true
 }
@@ -137,7 +133,7 @@ func NewServer() *Server {
 		ConsoleHistory: make([]string, 0),
 		EventLog:       make([]EventEntry, 0, 200),
 		Stats:          ServerStats{StartTime: time.Now(), TorAddress: torAddr},
-		BlacklistMap:   make(map[string]bool),
+		BlacklistMap:   make(map[string]string),
 		WhitelistMap:   make(map[string]bool),
 	}
 }
@@ -166,8 +162,8 @@ func (s *Server) GetBlockedList() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []string
-	for k := range s.BlacklistMap {
-		out = append(out, k)
+	for id, nick := range s.BlacklistMap {
+		out = append(out, fmt.Sprintf("%s (%s)", id, nick))
 	}
 	return out
 }
@@ -290,7 +286,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	// Check persistent maps BEFORE creating client
 	s.mu.RLock()
-	isBanned := s.BlacklistMap[identity] || s.BlacklistMap[nickname]
+	_, isBanned := s.BlacklistMap[identity]
 	isAutoApproved := s.WhitelistMap[identity]
 	s.mu.RUnlock()
 
@@ -346,8 +342,17 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if client.State == "WHITELISTED" {
 		s.SendSystemMessage(client, "✅ You have been approved by an admin!")
 		s.BroadcastUserList()
+		
+		// Log join to history
+		joinMsg := fmt.Sprintf("➜ %s joined the chat", nickname)
+		s.DBManager.SaveMessage(config.MsgTypeJoin, joinMsg, "SERVER")
+		
 		s.Log(fmt.Sprintf("Auto-approved user: %s (%s)", nickname, remoteAddr))
 		s.AddEvent("✅", fmt.Sprintf("Auto-approved: %s (%s)", nickname, remoteAddr))
+		
+		// Broadcast join to others
+		bMsg := protocol.CreateMessage(config.MsgTypeJoin, joinMsg, "SERVER")
+		s.BroadcastToState("WHITELISTED", bMsg, remoteAddr)
 	} else {
 		s.SendSystemMessage(client, "👋 Waiting for admin approval...")
 		s.Log(fmt.Sprintf("Pending approval: %s (%s)", nickname, remoteAddr))
@@ -383,9 +388,13 @@ func (s *Server) removeClient(client *Client) {
 	// two goroutines reading from the same channel simultaneously.
 	client.Conn.Close()
 	
-	if client.State == "WHITELISTED" || client.State == "BLACKLISTED" {
-		leaveMsg := protocol.CreateMessage(config.MsgTypeJoin, fmt.Sprintf("%s left the chat", client.Nickname), "SERVER")
-		s.BroadcastToState(client.State, leaveMsg, client.Address)
+	if client.State == "WHITELISTED" {
+		leaveMsg := fmt.Sprintf("⇠ %s left the chat", client.Nickname)
+		s.DBManager.SaveMessage(config.MsgTypeJoin, leaveMsg, "SERVER")
+		
+		bMsg := protocol.CreateMessage(config.MsgTypeJoin, leaveMsg, "SERVER")
+		s.BroadcastToState(client.State, bMsg, client.Address)
+		
 		s.Log(fmt.Sprintf("Client disconnected: %s (%s)", client.Nickname, client.Address))
 		s.AddEvent("🔴", fmt.Sprintf("Disconnected: %s [%s]", client.Nickname, client.State))
 		s.BroadcastUserList()
@@ -528,9 +537,6 @@ func (s *Server) processClientMessage(client *Client, text string) {
 	case "WHITELISTED":
 		s.DBManager.SaveMessage(config.MsgTypeChat, msg.Content, client.Nickname)
 		s.Log(fmt.Sprintf("[WHITELIST] %s: %s", client.Nickname, msg.Content))
-	case "BLACKLISTED":
-		s.BlacklistDB.SaveMessage(config.MsgTypeChat, msg.Content, client.Nickname)
-		s.Log(fmt.Sprintf("[BLACKLIST] %s: %s", client.Nickname, msg.Content))
 	}
 
 	broadcastMsg := protocol.CreateMessage(config.MsgTypeChat, msg.Content, client.Nickname)
@@ -584,8 +590,10 @@ func (s *Server) handleCommand(client *Client, content string) {
 	case "/ann":
 		if client.IsAdmin && len(parts) >= 2 {
 			annText := strings.Join(parts[1:], " ")
-			annMsg := protocol.CreateMessage(config.MsgTypeSystem,
-				fmt.Sprintf("📢 ANNOUNCEMENT: %s", annText), "ADMIN")
+			fullText := fmt.Sprintf("📢 ANNOUNCEMENT: %s", annText)
+			annMsg := protocol.CreateMessage(config.MsgTypeSystem, fullText, "ADMIN")
+			
+			s.DBManager.SaveMessage(config.MsgTypeSystem, fullText, "ADMIN")
 			s.BroadcastToState(client.State, annMsg, "")
 			s.Log(fmt.Sprintf("[ANN] %s: %s", client.Nickname, annText))
 		} else {

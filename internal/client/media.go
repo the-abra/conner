@@ -13,30 +13,19 @@ import (
 // maxExtractSize is the decompression bomb limit (G110): 100 MB
 const maxExtractSize = 100 * 1024 * 1024
 
-// CreateMediaTarBase64 packs a single file into a tar archive and returns
-// (basename, base64EncodedTar, error). The caller is responsible for supplying
-// a trusted path obtained from the local user.
+// CreateMediaTarBase64 packs a file or directory into a tar archive and returns
+// (basename, base64EncodedTar, error).
 func CreateMediaTarBase64(path string) (string, string, error) {
-	// #nosec G304 — user-supplied path is intentional (upload command)
-	file, err := os.Open(filepath.Clean(path))
+	absPath, err := filepath.Abs(filepath.Clean(path))
 	if err != nil {
-		return "", "", fmt.Errorf("open %q: %w", path, err)
+		return "", "", fmt.Errorf("abs %q: %w", path, err)
 	}
-	defer file.Close()
-
-	info, err := file.Stat()
+	_, err = os.Stat(absPath)
 	if err != nil {
 		return "", "", fmt.Errorf("stat %q: %w", path, err)
 	}
-	if info.IsDir() {
-		return "", "", fmt.Errorf("%q is a directory, only files are supported", path)
-	}
-	if info.Size() > maxExtractSize {
-		return "", "", fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), maxExtractSize)
-	}
 
-	// Write tar to a temp file so we can base64-encode without buffering the
-	// whole thing in memory before the header is finalized.
+	// Write tar to a temp file
 	tmpFile, err := os.CreateTemp("", "conner_media_*.tar")
 	if err != nil {
 		return "", "", fmt.Errorf("create temp: %w", err)
@@ -46,17 +35,47 @@ func CreateMediaTarBase64(path string) (string, string, error) {
 	defer tmpFile.Close()
 
 	tw := tar.NewWriter(tmpFile)
-	hdr := &tar.Header{
-		Name: filepath.Base(path),
-		Mode: 0600,
-		Size: info.Size(),
+	baseDir := filepath.Dir(absPath)
+
+	walkErr := filepath.Walk(absPath, func(p string, i os.FileInfo, e error) error {
+		if e != nil {
+			return e
+		}
+		if i.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(baseDir, p)
+		if err != nil {
+			return err
+		}
+
+		// #nosec G304
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		hdr, err := tar.FileInfoHeader(i, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = rel
+
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, f); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if walkErr != nil {
+		return "", "", fmt.Errorf("walk %q: %w", absPath, walkErr)
 	}
-	if err := tw.WriteHeader(hdr); err != nil {
-		return "", "", fmt.Errorf("tar header: %w", err)
-	}
-	if _, err := io.Copy(tw, file); err != nil {
-		return "", "", fmt.Errorf("tar write: %w", err)
-	}
+
 	if err := tw.Close(); err != nil {
 		return "", "", fmt.Errorf("tar close: %w", err)
 	}
@@ -73,7 +92,7 @@ func CreateMediaTarBase64(path string) (string, string, error) {
 }
 
 // ExtractMediaTarBase64 decodes a base64-encoded tar archive and extracts
-// the first entry into destDir. Returns the absolute path of the saved file.
+// ALL entries into destDir. Returns the absolute path of the destination directory.
 func ExtractMediaTarBase64(base64Data string, destDir string) (string, error) {
 	tarData, err := base64.StdEncoding.DecodeString(base64Data)
 	if err != nil {
@@ -83,53 +102,63 @@ func ExtractMediaTarBase64(base64Data string, destDir string) (string, error) {
 		return "", fmt.Errorf("empty tar data")
 	}
 
-	// G301: restrict directory permissions (0777 requested for Docker compatibility)
-	// #nosec G301
-	if err := os.MkdirAll(destDir, 0777); err != nil {
-		return "", fmt.Errorf("mkdir %q: %w", destDir, err)
-	}
-
-	// Work in memory — no need for a temp file on the receive side since
-	// tarData is already decoded.
-	tr := tar.NewReader(strings.NewReader(string(tarData)))
-	hdr, err := tr.Next()
-	if err != nil {
-		return "", fmt.Errorf("tar read: %w", err)
-	}
-
-	// G305: prevent path traversal
-	cleanName := filepath.Base(hdr.Name)
-	if cleanName == "" || cleanName == "." || strings.Contains(cleanName, "..") {
-		return "", fmt.Errorf("unsafe tar entry name: %q", hdr.Name)
-	}
-	destPath := filepath.Join(destDir, cleanName)
-
-	// Double-check destPath stays within destDir after Join (symlink-safe)
 	absBase, err := filepath.Abs(destDir)
 	if err != nil {
 		return "", fmt.Errorf("abs destDir: %w", err)
 	}
-	absDest, err := filepath.Abs(destPath)
-	if err != nil {
-		return "", fmt.Errorf("abs destPath: %w", err)
-	}
-	if !strings.HasPrefix(absDest, absBase+string(os.PathSeparator)) {
-		return "", fmt.Errorf("path traversal detected: %q escapes %q", destPath, destDir)
+
+	// #nosec G301
+	if err := os.MkdirAll(absBase, 0777); err != nil {
+		return "", fmt.Errorf("mkdir %q: %w", absBase, err)
 	}
 
-	// G110: limit extracted bytes to prevent decompression bomb
-	// #nosec G304,G302 — path validated above, 0666 intentional for Docker
-	outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		return "", fmt.Errorf("create %q: %w", destPath, err)
-	}
-	defer outFile.Close()
+	var firstPath string
+	tr := tar.NewReader(strings.NewReader(string(tarData)))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("tar read: %w", err)
+		}
 
-	written, err := io.CopyN(outFile, tr, maxExtractSize)
-	if err != nil && err != io.EOF {
-		_ = os.Remove(destPath) // clean up partial file
-		return "", fmt.Errorf("extract error after %d bytes (possible bomb): %w", written, err)
+		// G305: prevent path traversal
+		destPath := filepath.Join(absBase, hdr.Name)
+		if !strings.HasPrefix(filepath.Clean(destPath), absBase) {
+			return "", fmt.Errorf("path traversal detected: %q escapes %q", hdr.Name, absBase)
+		}
+
+		if firstPath == "" {
+			firstPath = destPath
+		}
+
+		if hdr.Typeflag == tar.TypeDir {
+			// #nosec G301
+			if err := os.MkdirAll(destPath, 0777); err != nil {
+				return "", fmt.Errorf("mkdir %q: %w", destPath, err)
+			}
+			continue
+		}
+
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(destPath), 0777); err != nil { // #nosec G301
+			return "", fmt.Errorf("mkdir parent %q: %w", destPath, err)
+		}
+
+		// #nosec G304,G302
+		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+		if err != nil {
+			return "", fmt.Errorf("create %q: %w", destPath, err)
+		}
+
+		written, err := io.CopyN(outFile, tr, maxExtractSize)
+		outFile.Close()
+		if err != nil && err != io.EOF {
+			_ = os.Remove(destPath)
+			return "", fmt.Errorf("extract error after %d bytes: %w", written, err)
+		}
 	}
 
-	return absDest, nil
+	return firstPath, nil
 }

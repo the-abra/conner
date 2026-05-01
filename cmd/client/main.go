@@ -25,6 +25,14 @@ func main() {
 
 	cli, err := client.Connect(nickname, address)
 	if err != nil {
+		if err == client.ErrBanned {
+			// Start TUI anyway to show the Banned modal
+			p := tea.NewProgram(tui.InitialModel(nil, nickname), tea.WithAltScreen(), tea.WithMouseCellMotion())
+			if _, err := p.Run(); err != nil {
+				log.Fatal(err)
+			}
+			return
+		}
 		log.Fatalf("Failed to connect: %v", err)
 	}
 

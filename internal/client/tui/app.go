@@ -8,6 +8,8 @@ import (
 	"conner/internal/client"
 	"conner/internal/config"
 	"conner/internal/protocol"
+	"path/filepath"
+
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,24 +19,24 @@ import (
 // ─── Colour palette ──────────────────────────────────────────────────────────
 
 var (
-	clrSelf    = lipgloss.Color("#A259FF") // purple  — own messages
-	clrOther   = lipgloss.Color("#4B9EFF") // blue    — other users
-	clrSystem  = lipgloss.Color("#FF8C00") // orange  — system / server notices
-	clrAdmin   = lipgloss.Color("#00FFCC") // teal    — admin timestamp accent
-	clrMsgBody = lipgloss.Color("#DDDDDD") // white   — message body (everyone)
-	clrDim     = lipgloss.Color("#555555") // dim gray — decorators
-	clrGreen   = lipgloss.Color("#00FF41")
-	clrDkGreen = lipgloss.Color("#008F11")
+	clrSelf    = lipgloss.Color("#A259FF") // purple
+	clrOther   = lipgloss.Color("#4B9EFF") // blue
+	clrSystem  = lipgloss.Color("#FF8C00") // orange
+	clrAdmin   = lipgloss.Color("#00FFCC") // teal
+	clrMsgBody = lipgloss.Color("#FFFFFF") // white text
+	clrDim     = lipgloss.Color("#555555") // gray
+	clrGreen   = lipgloss.Color("#FFFFFF") // CHANGED TO WHITE
+	clrDkGreen = lipgloss.Color("#AAAAAA") // CHANGED TO GRAY
 	clrYellow  = lipgloss.Color("#FFFF00")
 	clrRed     = lipgloss.Color("#FF0000")
 	clrBlue    = lipgloss.Color("#4B9EFF")
-	clrInput   = lipgloss.Color("#AAAAAA")
+	clrInput   = lipgloss.Color("#FFFFFF") // White input text
 
-	styleSelf   = lipgloss.NewStyle().Foreground(clrSelf).Bold(true)
-	styleOther  = lipgloss.NewStyle().Foreground(clrOther).Bold(true)
-	styleSystem = lipgloss.NewStyle().Foreground(clrSystem).Italic(true)
-	styleDim    = lipgloss.NewStyle().Foreground(clrDim)
-	styleBody   = lipgloss.NewStyle().Foreground(clrMsgBody)
+	styleSelf    = lipgloss.NewStyle().Foreground(clrSelf).Bold(true)
+	styleOther   = lipgloss.NewStyle().Foreground(clrOther).Bold(true)
+	styleSystem  = lipgloss.NewStyle().Foreground(clrSystem).Italic(true)
+	styleDim     = lipgloss.NewStyle().Foreground(clrDim)
+	styleBody    = lipgloss.NewStyle().Foreground(clrMsgBody)
 	styleAdminTS = lipgloss.NewStyle().Foreground(clrAdmin)
 
 	styleTitleBar = lipgloss.NewStyle().
@@ -58,10 +60,10 @@ var (
 			Foreground(clrMsgBody)
 
 	styleApprovedBox = lipgloss.NewStyle().
-			Border(lipgloss.DoubleBorder()).
-			BorderForeground(clrGreen).
-			Padding(1, 2).
-			Foreground(clrMsgBody)
+				Border(lipgloss.DoubleBorder()).
+				BorderForeground(clrGreen).
+				Padding(1, 2).
+				Foreground(clrMsgBody)
 
 	styleKickedBox = lipgloss.NewStyle().
 			Border(lipgloss.DoubleBorder()).
@@ -102,33 +104,41 @@ type model struct {
 	lines       []string // rendered lines in the viewport
 	showHelp    bool
 	isUploading bool
-	state       string   // PENDING, WHITELISTED
+	state       string // PENDING, WHITELISTED
 	onlineUsers []string
+	isAdmin     bool
 }
 
 func InitialModel(c *client.Client, nick string) tea.Model {
-	ti := textinput.New()
-	ti.Placeholder = "Type a message... (/help for commands)"
-	ti.PromptStyle = lipgloss.NewStyle().Foreground(clrGreen)
-	ti.TextStyle = lipgloss.NewStyle().Foreground(clrInput)
-	ti.Focus()
-
-	vp := viewport.New(0, 0)
-
-	return model{
+	m := &model{
 		cli:      c,
 		nickname: nick,
-		input:    ti,
-		viewport: vp,
+		input:    textinput.New(),
+		viewport: viewport.New(0, 0),
 		state:    "PENDING",
 	}
+	if c == nil {
+		m.state = "BANNED"
+	}
+
+	m.input.Placeholder = "Type a message... (/help for commands)"
+	m.input.PromptStyle = lipgloss.NewStyle().Foreground(clrGreen)
+	m.input.TextStyle = lipgloss.NewStyle().Foreground(clrInput)
+	m.input.Focus()
+	return m
 }
 
 func (m model) Init() tea.Cmd {
+	if m.cli == nil {
+		return nil
+	}
 	return tea.Batch(textinput.Blink, m.waitForMsg())
 }
 
 func (m model) waitForMsg() tea.Cmd {
+	if m.cli == nil {
+		return nil
+	}
 	return func() tea.Msg {
 		return incomingMsg(<-m.cli.UpdateChan)
 	}
@@ -152,6 +162,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = "SHADOW_APPROVED"
 			} else if strings.Contains(msg.Content, "You have been kicked") {
 				m.state = "KICKED"
+			} else if strings.Contains(msg.Content, "admin privileges") {
+				m.isAdmin = true
 			} else if strings.Contains(msg.Content, "Connection closed") {
 				if m.state != "KICKED" {
 					m.state = "DISCONNECTED"
@@ -211,7 +223,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.HasPrefix(val, "/") {
 				cmds := []string{"/list", "/private ", "/upload ", "/download ", "/help", "/quit"}
 				current := strings.Split(val, " ")[0]
-				
+
 				var matches []string
 				for _, c := range cmds {
 					if strings.HasPrefix(c, current) {
@@ -286,28 +298,33 @@ func (m *model) handleInput(val string) tea.Cmd {
 		m.showHelp = true
 		return nil
 
-	case strings.HasPrefix(val, "/upload "):
-		path := strings.TrimPrefix(val, "/upload ")
-		m.isUploading = true
-		m.appendSystem("⏳ Reading " + path + "…")
-		m.refreshViewport()
-		return func() tea.Msg {
-			fn, b64, err := client.CreateMediaTarBase64(path)
-			return uploadDoneMsg{err: err, filename: fn, b64data: b64}
+	case strings.HasPrefix(val, "/upload"):
+		parts := strings.SplitN(val, " ", 2)
+		if len(parts) == 2 {
+			path := parts[1]
+			if err := m.cli.RegisterFile(path); err != nil {
+				m.appendSystem("✗ Upload failed: " + err.Error())
+			} else {
+				m.appendSystem("✓ File registered for sharing: " + filepath.Base(path))
+			}
+			m.refreshViewport()
+		} else {
+			m.appendSystem("Usage: /upload <file-path>")
+			m.refreshViewport()
 		}
 
-	case strings.HasPrefix(val, "/download "):
-		parts := strings.SplitN(val, " ", 3)
-		if len(parts) == 3 {
-			fileID, destDir := parts[1], parts[2]
-			m.appendSystem("⬇  Requesting " + fileID + " → " + destDir + "…")
+	case strings.HasPrefix(val, "/download"):
+		parts := strings.SplitN(val, " ", 2)
+		if len(parts) == 2 {
+			fileID := parts[1]
+			m.appendSystem("⬇  Requesting " + fileID + "…")
 			m.refreshViewport()
-			// Push destDir first so readPump picks it up when MediaData arrives.
-			m.cli.PendingDownloadDir <- destDir
+			// Push fixed "downloads" dir
+			m.cli.PendingDownloadDir <- "downloads"
 			reqMsg := protocol.CreateMessage(config.MsgTypeDownloadReq, fileID, m.nickname)
 			m.cli.SendChan <- reqMsg
 		} else {
-			m.appendSystem("Usage: /download <id> <save-dir>")
+			m.appendSystem("Usage: /download <id>")
 			m.refreshViewport()
 		}
 
@@ -426,6 +443,23 @@ func (m model) View() string {
 			lipgloss.Center, lipgloss.Center,
 			styleApprovedBox.Render(approved))
 	}
+	// ── Overlay: BANNED ───────────────────────────────────────────────────
+	if m.state == "BANNED" {
+		banned := fmt.Sprintf(`
+  ACCESS DENIED
+  ─────────────────────────────────────────────
+  You have been permanently banned from
+  this server.
+  
+  Identity: %s
+  
+  [Ctrl+C] or [ESC] to Exit.
+`, m.nickname)
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			styleKickedBox.Render(banned))
+	}
+
 	// ── Overlay: KICKED ───────────────────────────────────────────────────
 	if m.state == "KICKED" {
 		kicked := fmt.Sprintf(`
@@ -477,14 +511,24 @@ func (m model) View() string {
 
 	// ── Overlay: HELP ─────────────────────────────────────────────────────
 	if m.showHelp {
-		help := `
+		adminCmds := ""
+		if m.isAdmin {
+			adminCmds = `  /connect <nick>    Approve a pending user
+  /block <nick>      Block and disconnect user
+  /kick <nick>       Disconnect a user
+  /ann <msg>         Send global announcement
+  /op <nick>         Grant admin permissions
+`
+		}
+
+		help := fmt.Sprintf(`
   CONNER CLIENT — Commands
   ─────────────────────────────────────
   /list              List online users
   /private <u> <msg> Send private message
-  /upload <path>     Upload a file
-  /download <id> <d> Download a file
-  /help              Show this menu
+  /upload <path>     Share a file/folder
+  /download <id>     Download a file
+%s  /help              Show this menu
   /quit              Disconnect
 
   [Tab]              Auto-complete / commands
@@ -492,7 +536,7 @@ func (m model) View() string {
   [ESC / Enter / F1] Close this menu
   [↑ ↓ PgUp PgDn]    Scroll chat
   [Ctrl+C]           Force quit
-`
+`, adminCmds)
 		return lipgloss.Place(m.width, m.height,
 			lipgloss.Center, lipgloss.Center,
 			styleHelp.Render(help))
@@ -528,13 +572,13 @@ func (m model) View() string {
 			userListSB.WriteString("• " + u + "\n")
 		}
 		userListStr := styleUserList.Width(userListWidth).Height(m.viewport.Height).Render(userListSB.String())
-		
+
 		mainView := lipgloss.JoinHorizontal(lipgloss.Top, chatView, userListStr)
 		sb.WriteString(mainView)
 	} else {
 		sb.WriteString(chatView)
 	}
-	
+
 	sb.WriteString("\n")
 
 	// Input box
