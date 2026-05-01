@@ -585,9 +585,10 @@ func (m Model) renderTab() string {
 	case tabBlacklist:
 		var sb strings.Builder
 		sb.WriteString(styleTitle.Render(" BLOCKED IDENTITIES / NICKNAMES ") + "\n")
-		sb.WriteString(styleGray("  Active blocks that prevent reconnection:\n"))
+		sb.WriteString(styleGray("  Active blocks that prevent reconnection:"))
+
 		for _, b := range m.srv.GetBlockedList() {
-			sb.WriteString("  " + styleBL.Render("⛔") + " " + b + "\n")
+			sb.WriteString("\n" + "  " + styleBL.Render("⛔") + " " + b)
 		}
 		return sb.String()
 
