@@ -397,9 +397,8 @@ func (m *Model) executeAdminCommand(val string) {
 
 	case "/purge":
 		m.srv.DBManager.Clear()
-		m.srv.BlacklistDB.Clear()
-		m.srv.Log("Admin purged all messages")
-		m.statusMsg = "🗑 All messages purged"
+		m.srv.Log("Admin purged all persistent data")
+		m.statusMsg = "🗑 Database purged"
 
 	default:
 		m.statusMsg = "Unknown command: " + cmd

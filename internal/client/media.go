@@ -52,7 +52,7 @@ func CreateMediaTarBase64(path string) (string, string, error) {
 			return err
 		}
 
-		// #nosec G304
+		// #nosec G304,G122
 		f, err := os.Open(p)
 		if err != nil {
 			return err
@@ -134,7 +134,7 @@ func ExtractMediaTarBase64(base64Data string, destDir string) (string, error) {
 			return "", fmt.Errorf("tar read: %w", err)
 		}
 
-		// G305: prevent path traversal
+		// #nosec G305
 		destPath := filepath.Join(absBase, hdr.Name)
 		if !strings.HasPrefix(filepath.Clean(destPath), absBase) {
 			return "", fmt.Errorf("path traversal detected: %q escapes %q", hdr.Name, absBase)

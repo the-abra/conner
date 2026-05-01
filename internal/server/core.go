@@ -34,7 +34,6 @@ type EventEntry struct {
 type Server struct {
 	ClientManager  *ClientManager
 	DBManager      *MemoryManager
-	BlacklistDB    *MemoryManager
 	MediaDB        sync.Map // map[string]*MediaEntry
 	BroadcastKey   []byte
 	Running        bool
@@ -45,6 +44,7 @@ type Server struct {
 	EventLog       []EventEntry      // ring buffer of real-time notifications
 	BlacklistMap   map[string]string // Identity -> Nickname (Metadata)
 	WhitelistMap   map[string]bool   // Identity -> bool
+	CmdRegistry    *CommandRegistry
 }
 
 type ServerStats struct {
@@ -70,7 +70,7 @@ func (s *Server) ApproveClient(nickname string) bool {
 	s.WhitelistMap[target.Identity] = true
 	delete(s.BlacklistMap, target.Identity)
 	s.mu.Unlock()
-
+	
 	s.SendSystemMessage(target, "✅ You have been approved by an admin. Welcome!")
 	s.Log("Admin approved: " + nickname)
 	s.AddEvent("✅", "Admin approved: "+nickname+" → CHAT ROOM")
@@ -127,12 +127,12 @@ func NewServer() *Server {
 	return &Server{
 		ClientManager:  NewClientManager(),
 		DBManager:      NewMemoryManager(config.MessageHistoryLimit, config.MessageTTL),
-		BlacklistDB:    NewMemoryManager(config.MessageHistoryLimit, config.MessageTTL),
 		BroadcastKey:   crypto.GenerateRandomKey(),
 		Running:        true,
 		ConsoleHistory: make([]string, 0),
 		EventLog:       make([]EventEntry, 0, 200),
 		Stats:          ServerStats{StartTime: time.Now(), TorAddress: torAddr},
+		CmdRegistry:    NewCommandRegistry(),
 		BlacklistMap:   make(map[string]string),
 		WhitelistMap:   make(map[string]bool),
 	}
@@ -210,10 +210,9 @@ func (s *Server) Start(port string) error {
 	go func() {
 		for s.Running {
 			time.Sleep(1 * time.Minute)
-			p1 := s.DBManager.CleanupOldMessages()
-			p2 := s.BlacklistDB.CleanupOldMessages()
-			if p1+p2 > 0 {
-				s.Log(fmt.Sprintf("TTL: Purged %d expired messages", p1+p2))
+			count := s.DBManager.CleanupOldMessages()
+			if count > 0 {
+				s.Log(fmt.Sprintf("TTL: Purged %d expired messages", count))
 			}
 		}
 	}()
@@ -321,12 +320,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	// Check persistent maps BEFORE creating client
 	s.mu.RLock()
-	_, isBanned := s.BlacklistMap[identity]
+	banNick, isBanned := s.BlacklistMap[identity]
 	isAutoApproved := s.WhitelistMap[identity]
 	s.mu.RUnlock()
 
 	if isBanned {
-		_ = protocol.SendFrame(conn, []byte("ERROR:You are banned from this server"))
+		_ = protocol.SendFrame(conn, []byte("ERROR:You are banned from this server (Identity: "+banNick+")"))
 		conn.Close()
 		return
 	}
@@ -591,101 +590,15 @@ func (s *Server) handleCommand(client *Client, content string) {
 	s.Stats.CommandsExecuted++
 	s.mu.Unlock()
 
-	parts := strings.SplitN(content, " ", 3)
-	if len(parts) == 0 {
-		return
-	}
-	cmd := parts[0]
+	s.CmdRegistry.Handle(s, client, content)
+}
 
-	switch cmd {
-	case "/list":
-		users := []string{}
-		for _, c := range s.ClientManager.GetAllClients() {
-			if c.State == client.State {
-				users = append(users, c.Nickname)
-			}
-		}
-		s.SendSystemMessage(client, "Online: "+strings.Join(users, ", "))
-		// Also send structured user list for sidebar
-		listMsg := protocol.CreateMessage(config.MsgTypeUserList, strings.Join(users, ","), "SERVER")
-		s.SendMessage(client, listMsg)
-
-	case "/private":
-		if len(parts) >= 3 {
-			target := parts[1]
-			privMsg := parts[2]
-			targetClient := s.ClientManager.GetClientByNickname(target)
-			if targetClient != nil && targetClient.State == client.State {
-				pm := protocol.CreateMessage(config.MsgTypePrivate, "[PM from "+client.Nickname+"]: "+privMsg, client.Nickname)
-				pmJSON, _ := pm.ToJSON()
-				enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(pmJSON))
-				select {
-				case targetClient.SendChan <- crypto.Base64Encode(enc):
-				default:
-				}
-				s.SendSystemMessage(client, "PM sent to "+target+".")
-			} else {
-				s.SendSystemMessage(client, "User not found or not in your room.")
-			}
-		}
-
-	case "/ann":
-		if client.IsAdmin && len(parts) >= 2 {
-			annText := strings.Join(parts[1:], " ")
-			fullText := fmt.Sprintf("📢 ANNOUNCEMENT: %s", annText)
-			annMsg := protocol.CreateMessage(config.MsgTypeSystem, fullText, "ADMIN")
-
-			s.DBManager.SaveMessage(config.MsgTypeSystem, fullText, "ADMIN")
-			s.BroadcastToState(client.State, annMsg, "")
-			s.Log(fmt.Sprintf("[ANN] %s: %s", client.Nickname, annText))
-		} else {
-			s.SendSystemMessage(client, "Unauthorized. Admin only.")
-		}
-
-	case "/op":
-		if client.IsAdmin && len(parts) >= 2 {
-			target := s.ClientManager.GetClientByNickname(parts[1])
-			if target != nil {
-				target.IsAdmin = true
-				s.SendSystemMessage(client, parts[1]+" is now an admin.")
-				s.SendSystemMessage(target, "You have been granted admin privileges.")
-			}
-		} else {
-			s.SendSystemMessage(client, "Unauthorized or missing argument.")
-		}
-
-	case "/connect":
-		if client.IsAdmin && len(parts) >= 2 {
-			if s.ApproveClient(parts[1]) {
-				s.SendSystemMessage(client, parts[1]+" moved to Chat Room.")
-			} else {
-				s.SendSystemMessage(client, "User not found: "+parts[1])
-			}
-		}
-
-	case "/block", "/blacklist":
-		if client.IsAdmin && len(parts) >= 2 {
-			if s.BlockClient(parts[1]) {
-				s.SendSystemMessage(client, parts[1]+" has been blocked.")
-			} else {
-				s.SendSystemMessage(client, "User not found: "+parts[1])
-			}
-		}
-
-	case "/kick":
-		if client.IsAdmin && len(parts) >= 2 {
-			target := s.ClientManager.GetClientByNickname(parts[1])
-			if target != nil {
-				s.AddEvent("⚡", fmt.Sprintf("%s kicked %s", client.Nickname, parts[1]))
-				s.SendSystemMessage(target, "⚡ You have been kicked from the server.")
-				time.Sleep(100 * time.Millisecond) // Ensure message is sent
-				s.removeClient(target)
-				s.SendSystemMessage(client, parts[1]+" has been kicked.")
-				s.Log(fmt.Sprintf("Admin %s kicked %s", client.Nickname, parts[1]))
-				s.BroadcastUserList()
-			}
-		}
-	}
+func (s *Server) BroadcastAnnouncement(text string) {
+	fullText := "📢 ANNOUNCEMENT: " + text
+	msg := protocol.CreateMessage(config.MsgTypeSystem, fullText, "ADMIN")
+	s.DBManager.SaveMessage(config.MsgTypeSystem, fullText, "ADMIN")
+	s.BroadcastToState("WHITELISTED", msg, "")
+	s.Log("[ANN] ADMIN: " + text)
 }
 
 func (s *Server) BroadcastUserList() {
