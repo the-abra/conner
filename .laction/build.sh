@@ -17,6 +17,7 @@ fi
 
 # 2. Build
 log_info "Building server and client..."
+rm -rf bin
 mkdir -p bin
 
 if go build -ldflags="-s -w" -o bin/conner-server ./cmd/server/main.go >/dev/null 2>&1; then

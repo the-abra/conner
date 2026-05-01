@@ -762,8 +762,9 @@ func (m Model) renderTab() string {
 
 		// ── Network ───────────────────────────────────────────────────────────
 		sb.WriteString(styleGray("  ── Network ─────────────────────────────────────────────"))
+		sb.WriteString("\n")
 		if len(snap.NetIfaces) == 0 {
-			sb.WriteString(styleGray("\n  No network interfaces detected.\n"))
+			sb.WriteString(styleGray("  No network interfaces detected.\n"))
 		}
 		for _, iface := range snap.NetIfaces {
 			sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Interface:", iface.Name))

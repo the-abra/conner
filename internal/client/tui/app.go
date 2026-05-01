@@ -26,6 +26,7 @@ var (
 	clrGreen   = lipgloss.Color("#00FF41")
 	clrDkGreen = lipgloss.Color("#008F11")
 	clrYellow  = lipgloss.Color("#FFFF00")
+	clrRed     = lipgloss.Color("#FF0000")
 	clrBlue    = lipgloss.Color("#4B9EFF")
 	clrInput   = lipgloss.Color("#AAAAAA")
 
@@ -59,6 +60,12 @@ var (
 	styleApprovedBox = lipgloss.NewStyle().
 			Border(lipgloss.DoubleBorder()).
 			BorderForeground(clrGreen).
+			Padding(1, 2).
+			Foreground(clrMsgBody)
+
+	styleKickedBox = lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(clrRed).
 			Padding(1, 2).
 			Foreground(clrMsgBody)
 
@@ -141,10 +148,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = "PENDING"
 			} else if strings.Contains(msg.Content, "You have been approved") {
 				m.state = "APPROVED"
+			} else if strings.Contains(msg.Content, "You have been kicked") {
+				m.state = "KICKED"
 			}
 		}
 		if msg.Type == config.MsgTypeUserList {
-			m.onlineUsers = strings.Split(msg.Content, ",")
+			rawUsers := strings.Split(msg.Content, ",")
+			m.onlineUsers = nil
+			for _, u := range rawUsers {
+				if strings.TrimSpace(u) != "" {
+					m.onlineUsers = append(m.onlineUsers, u)
+				}
+			}
 		}
 		m.lines = append(m.lines, m.renderMessage(protocol.ChatMessage(msg)))
 		m.refreshViewport()
@@ -401,6 +416,23 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height,
 			lipgloss.Center, lipgloss.Center,
 			styleApprovedBox.Render(approved))
+	}
+
+	// ── Overlay: KICKED ───────────────────────────────────────────────────
+	if m.state == "KICKED" {
+		kicked := fmt.Sprintf(`
+  CONNECTION TERMINATED
+  ─────────────────────────────────────────────
+  You have been kicked from the server
+  by an administrator.
+  
+  Nickname: %s
+  
+  [Ctrl+C] or [ESC] to Exit.
+`, m.nickname)
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			styleKickedBox.Render(kicked))
 	}
 
 	// ── Overlay: HELP ─────────────────────────────────────────────────────

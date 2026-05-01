@@ -317,6 +317,7 @@ func (s *Server) removeClient(client *Client) {
 		s.BroadcastToState(client.State, leaveMsg, client.Address)
 		s.Log(fmt.Sprintf("Client disconnected: %s (%s)", client.Nickname, client.Address))
 		s.AddEvent("🔴", fmt.Sprintf("Disconnected: %s [%s]", client.Nickname, client.State))
+		s.BroadcastUserList()
 	} else {
 		s.Log(fmt.Sprintf("Pending client disconnected: %s", client.Address))
 		s.AddEvent("🔌", fmt.Sprintf("Pending client dropped: %s", client.Address))
@@ -332,6 +333,17 @@ func (s *Server) SendSystemMessage(client *Client, content string) {
 	case client.SendChan <- crypto.Base64Encode(enc):
 	default:
 		s.Log(fmt.Sprintf("Dropped system message for %s (buffer full)", client.Nickname))
+	}
+}
+
+func (s *Server) SendMessage(client *Client, msg protocol.ChatMessage) {
+	msgJSON, _ := msg.ToJSON()
+	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
+	
+	select {
+	case client.SendChan <- crypto.Base64Encode(enc):
+	default:
+		s.Log(fmt.Sprintf("Dropped message for %s (buffer full)", client.Nickname))
 	}
 }
 
@@ -475,6 +487,9 @@ func (s *Server) handleCommand(client *Client, content string) {
 			}
 		}
 		s.SendSystemMessage(client, "Online: "+strings.Join(users, ", "))
+		// Also send structured user list for sidebar
+		listMsg := protocol.CreateMessage(config.MsgTypeUserList, strings.Join(users, ","), "SERVER")
+		s.SendMessage(client, listMsg)
 
 	case "/private":
 		if len(parts) >= 3 {
@@ -553,6 +568,7 @@ func (s *Server) handleCommand(client *Client, content string) {
 			target := s.ClientManager.GetClientByNickname(parts[1])
 			if target != nil {
 				s.AddEvent("⚡", fmt.Sprintf("%s kicked %s", client.Nickname, parts[1]))
+				s.SendSystemMessage(target, "⚡ You have been kicked from the server.")
 				s.removeClient(target)
 				s.SendSystemMessage(client, parts[1]+" has been kicked.")
 				s.Log(fmt.Sprintf("Admin %s kicked %s", client.Nickname, parts[1]))
