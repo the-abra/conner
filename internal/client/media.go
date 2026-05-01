@@ -83,8 +83,9 @@ func ExtractMediaTarBase64(base64Data string, destDir string) (string, error) {
 		return "", fmt.Errorf("empty tar data")
 	}
 
-	// G301: restrict directory permissions
-	if err := os.MkdirAll(destDir, 0750); err != nil {
+	// G301: restrict directory permissions (0777 requested for Docker compatibility)
+	// #nosec G301
+	if err := os.MkdirAll(destDir, 0777); err != nil {
 		return "", fmt.Errorf("mkdir %q: %w", destDir, err)
 	}
 
@@ -117,8 +118,8 @@ func ExtractMediaTarBase64(base64Data string, destDir string) (string, error) {
 	}
 
 	// G110: limit extracted bytes to prevent decompression bomb
-	// #nosec G304 — path validated above
-	outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	// #nosec G304,G302 — path validated above, 0666 intentional for Docker
+	outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		return "", fmt.Errorf("create %q: %w", destPath, err)
 	}

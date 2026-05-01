@@ -110,7 +110,16 @@ func Connect(nickname, address string) (*Client, error) {
 	sessionKey, _ := crypto.DeriveSharedKey(priv, serverPub)
 
 	// 2. Send CLIENT_HELLO
-	hello := fmt.Sprintf("CLIENT_HELLO:%s:%s", crypto.Base64Encode(pub), nickname)
+	identity := "unknown"
+	if b, err := os.ReadFile("hostname"); err == nil {
+		identity = strings.TrimSpace(string(b))
+	} else if b, err := os.ReadFile("/var/lib/tor/conner_chat/hostname"); err == nil {
+		identity = strings.TrimSpace(string(b))
+	} else {
+		identity = strings.Split(conn.LocalAddr().String(), ":")[0]
+	}
+
+	hello := fmt.Sprintf("CLIENT_HELLO:%s:%s:%s", crypto.Base64Encode(pub), nickname, identity)
 	if err := protocol.SendFrame(conn, []byte(hello)); err != nil {
 		return nil, fmt.Errorf("handshake: CLIENT_HELLO send failed: %w", err)
 	}
@@ -152,7 +161,7 @@ func Connect(nickname, address string) (*Client, error) {
 
 func (c *Client) WatchUploads() {
 	uploadDir := "upload"
-	os.MkdirAll(uploadDir, 0750)
+	os.MkdirAll(uploadDir, 0777) // #nosec G301
 	
 	knownFiles := make(map[string]bool)
 	

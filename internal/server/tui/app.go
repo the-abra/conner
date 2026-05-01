@@ -85,7 +85,7 @@ const (
 	tabSystem
 )
 
-var tabNames = []string{"Dashboard", "Whitelist", "Blacklist", "Clients", "Files", "System"}
+var tabNames = []string{"Dashboard", "Chat Room", "Blocked", "Clients", "Files", "System"}
 
 // ─── Model ───────────────────────────────────────────────────────────────────
 
@@ -100,6 +100,14 @@ type Model struct {
 	statusMsg   string
 	sysSnap     sysmon.Snapshot // cached system metrics
 	showHelp    bool
+}
+
+type tickMsg time.Time
+
+func tick() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 func InitialModel(s *server.Server) tea.Model {
@@ -121,16 +129,13 @@ func InitialModel(s *server.Server) tea.Model {
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, tickCmd())
+	return tea.Batch(
+		textinput.Blink,
+		tick(),
+	)
 }
 
-type tickMsg struct{}
-
-func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
-}
-
-// ─── Update ──────────────────────────────────────────────────────────────────
+// ─── Update ────────────────────────────────────────────────────────────────────
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -141,7 +146,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// Refresh system snapshot on every tick (1s)
 		m.sysSnap = sysmon.Collect()
-		cmds = append(cmds, tickCmd())
+		cmds = append(cmds, tick())
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -335,12 +340,7 @@ func (m *Model) executeAdminCommand(val string) {
 	switch cmd {
 	case "/connect", "/approve":
 		if len(parts) >= 2 {
-			c := m.srv.ClientManager.GetClientByNickname(parts[1])
-			if c != nil {
-				c.State = "WHITELISTED"
-				m.srv.SendSystemMessage(c, "✅ You have been approved by an admin. Welcome!")
-				m.srv.Log("Admin approved: " + parts[1])
-				m.srv.AddEvent("✅", "Admin approved: "+parts[1]+" → WHITELIST")
+			if m.srv.ApproveClient(parts[1]) {
 				m.statusMsg = "✓ Approved: " + parts[1]
 			} else {
 				m.statusMsg = "User not found: " + parts[1]
@@ -349,13 +349,8 @@ func (m *Model) executeAdminCommand(val string) {
 
 	case "/block", "/blacklist":
 		if len(parts) >= 2 {
-			c := m.srv.ClientManager.GetClientByNickname(parts[1])
-			if c != nil {
-				c.State = "BLACKLISTED"
-				m.srv.SendSystemMessage(c, "✅ Approved by bot. Welcome!")
-				m.srv.Log("Admin blacklisted (shadow): " + parts[1])
-				m.statusMsg = "✗ Blacklisted (Shadow): " + parts[1]
-				m.srv.AddEvent("⛔", "Admin blacklisted "+parts[1]+" → SHADOW ROOM")
+			if m.srv.BlockClient(parts[1]) {
+				m.statusMsg = "✗ Blocked: " + parts[1]
 			} else {
 				m.statusMsg = "User not found: " + parts[1]
 			}
@@ -365,9 +360,13 @@ func (m *Model) executeAdminCommand(val string) {
 		if len(parts) >= 2 {
 			c := m.srv.ClientManager.GetClientByNickname(parts[1])
 			if c != nil {
-				m.srv.Log("Admin kicked: " + parts[1])
+				m.srv.SendSystemMessage(c, "⚡ You have been kicked from the server.")
+				target := c
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					m.srv.RemoveClient(target)
+				}()
 				m.statusMsg = "⚡ Kicked: " + parts[1]
-				c.Conn.Close()
 			} else {
 				m.statusMsg = "User not found: " + parts[1]
 			}
@@ -419,7 +418,7 @@ func (m Model) View() string {
   CONNER ADMIN PANEL — Commands
   ─────────────────────────────────────────────
   /connect <nick>    Approve a pending user
-  /block <nick>      Move user to shadow room
+  /block <nick>      Block and disconnect user
   /kick <nick>       Disconnect a user
   /ann <msg>         Send global announcement
   /op <nick>         Grant admin permissions
@@ -574,7 +573,7 @@ func (m Model) renderTab() string {
 
 	case tabWhitelist:
 		var sb strings.Builder
-		sb.WriteString(styleTitle.Render(" WHITELIST CHAT ") + "\n")
+		sb.WriteString(styleTitle.Render(" CHAT ROOM ") + "\n")
 		for _, msg := range m.srv.DBManager.GetHistory() {
 			ts := styleGray("[" + msg.Timestamp + "]")
 			sender := styleWL.Render(msg.Sender)
@@ -584,11 +583,10 @@ func (m Model) renderTab() string {
 
 	case tabBlacklist:
 		var sb strings.Builder
-		sb.WriteString(styleTitle.Render(" BLACKLIST CHAT (Shadow Room) ") + "\n")
-		for _, msg := range m.srv.BlacklistDB.GetHistory() {
-			ts := styleGray("[" + msg.Timestamp + "]")
-			sender := styleBL.Render(msg.Sender)
-			sb.WriteString(fmt.Sprintf("  %s %s: %s\n", ts, sender, msg.Content))
+		sb.WriteString(styleTitle.Render(" BLOCKED IDENTITIES / NICKNAMES ") + "\n")
+		sb.WriteString(styleGray("  Active blocks that prevent reconnection:\n\n"))
+		for _, b := range m.srv.GetBlockedList() {
+			sb.WriteString("  " + styleBL.Render("⛔") + " " + b + "\n")
 		}
 		return sb.String()
 
@@ -805,6 +803,12 @@ func styleGray(s string) string {
 }
 
 func truncate(s string, max int) string {
+	if max < 1 {
+		if s != "" {
+			return "…"
+		}
+		return ""
+	}
 	if len(s) <= max {
 		return s
 	}

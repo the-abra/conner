@@ -10,6 +10,7 @@ type Client struct {
 	Conn          net.Conn
 	Nickname      string
 	Address       string
+	Identity      string // Self-reported Onion or IP address
 	JoinTime      time.Time
 	EncryptionKey []byte
 	State         string // PENDING, WHITELISTED, BLACKLISTED

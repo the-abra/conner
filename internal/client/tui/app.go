@@ -148,8 +148,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = "PENDING"
 			} else if strings.Contains(msg.Content, "You have been approved") {
 				m.state = "APPROVED"
+			} else if strings.Contains(msg.Content, "Approved by shadow bot") {
+				m.state = "SHADOW_APPROVED"
 			} else if strings.Contains(msg.Content, "You have been kicked") {
 				m.state = "KICKED"
+			} else if strings.Contains(msg.Content, "Connection closed") {
+				if m.state != "KICKED" {
+					m.state = "DISCONNECTED"
+				}
 			}
 		}
 		if msg.Type == config.MsgTypeUserList {
@@ -161,9 +167,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		m.lines = append(m.lines, m.renderMessage(protocol.ChatMessage(msg)))
-		m.refreshViewport()
+		if msg.Type != config.MsgTypeUserList {
+			m.lines = append(m.lines, m.renderMessage(protocol.ChatMessage(msg)))
+			m.refreshViewport()
+		}
 		cmds = append(cmds, m.waitForMsg())
+		return m, tea.Batch(cmds...)
 
 	case uploadDoneMsg:
 		m.isUploading = false
@@ -226,8 +235,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
-			if m.state == "APPROVED" {
-				m.state = "WHITELISTED"
+			if m.state == "APPROVED" || m.state == "SHADOW_APPROVED" {
+				m.state = ""
 				return m, nil
 			}
 			if m.showHelp {
@@ -417,7 +426,6 @@ func (m model) View() string {
 			lipgloss.Center, lipgloss.Center,
 			styleApprovedBox.Render(approved))
 	}
-
 	// ── Overlay: KICKED ───────────────────────────────────────────────────
 	if m.state == "KICKED" {
 		kicked := fmt.Sprintf(`
@@ -433,6 +441,38 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height,
 			lipgloss.Center, lipgloss.Center,
 			styleKickedBox.Render(kicked))
+	}
+
+	// ── Overlay: SHADOW APPROVED ──────────────────────────────────────────
+	if m.state == "SHADOW_APPROVED" {
+		approved := fmt.Sprintf(`
+  ACCESS GRANTED (SHADOW)
+  ─────────────────────────────────────────────
+  You have been approved by an admin!
+  
+  Nickname: %s
+  
+  Press [ ENTER ] to join the chat.
+`, m.nickname)
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			styleKickedBox.Render(approved)) // Use red box for shadow
+	}
+
+	// ── Overlay: DISCONNECTED ─────────────────────────────────────────────
+	if m.state == "DISCONNECTED" {
+		disc := fmt.Sprintf(`
+  CONNECTION LOST
+  ─────────────────────────────────────────────
+  The connection to the server was lost.
+  
+  Nickname: %s
+  
+  [Ctrl+C] or [ESC] to Exit.
+`, m.nickname)
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			styleKickedBox.Render(disc))
 	}
 
 	// ── Overlay: HELP ─────────────────────────────────────────────────────
