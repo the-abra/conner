@@ -180,7 +180,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if msg.Type != config.MsgTypeUserList {
-			m.lines = append(m.lines, m.renderMessage(protocol.ChatMessage(msg)))
+			m.appendLine(m.renderMessage(protocol.ChatMessage(msg)))
 			m.refreshViewport()
 		}
 		cmds = append(cmds, m.waitForMsg())
@@ -333,15 +333,22 @@ func (m *model) handleInput(val string) tea.Cmd {
 		chatMsg := protocol.CreateMessage(config.MsgTypeChat, val, m.nickname)
 		m.cli.SendChan <- chatMsg
 		// Echo own message locally
-		line := m.renderSelf(val)
-		m.lines = append(m.lines, line)
+		m.appendLine(m.renderSelf(val))
 		m.refreshViewport()
 	}
 	return nil
 }
 
+func (m *model) appendLine(line string) {
+	m.lines = append(m.lines, line)
+	// Limit history to 1000 lines to prevent memory bloat
+	if len(m.lines) > 1000 {
+		m.lines = m.lines[len(m.lines)-1000:]
+	}
+}
+
 func (m *model) appendSystem(text string) {
-	m.lines = append(m.lines, styleSystem.Render("  · "+text))
+	m.appendLine(styleSystem.Render("  · " + text))
 }
 
 func (m *model) refreshViewport() {

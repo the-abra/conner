@@ -62,11 +62,25 @@ type Client struct {
 	Conn               net.Conn
 	SessionKey         []byte
 	BroadcastKey       []byte // shared group key, received from server after handshake
+	Nickname           string
 	Messages           []string
 	SendChan           chan protocol.ChatMessage
 	UpdateChan         chan protocol.ChatMessage // typed messages for rich TUI rendering
 	PendingDownloadDir chan string               // TUI pushes destDir before sending DOWNLOAD_REQ
 	sharedFiles        map[string]string         // filename -> absolute path
+	SigningPriv        []byte                    // Ed25519 Private Key for identity
+	SigningPub         []byte                    // Ed25519 Public Key for identity
+}
+
+func loadIdentityKeys() (pub []byte, priv []byte) {
+	keyFile := "identity.key"
+	if data, err := os.ReadFile(keyFile); err == nil && len(data) == 64 {
+		return data[32:], data[:64]
+	}
+	// Generate new
+	p, s, _ := crypto.GenerateSigningKeyPair()
+	_ = os.WriteFile(keyFile, s, 0600)
+	return p, s
 }
 
 func Connect(nickname, address string) (*Client, error) {
@@ -120,9 +134,22 @@ func Connect(nickname, address string) (*Client, error) {
 		conn.Close()
 		return nil, fmt.Errorf("handshake: expected KEY_EXCHANGE, got: %s", line)
 	}
-	serverPub, _ := crypto.Base64Decode(strings.TrimSpace(strings.Split(line, ":")[1]))
+
+	exchangeParts := strings.Split(strings.TrimPrefix(line, "KEY_EXCHANGE:"), "|")
+	if len(exchangeParts) < 2 {
+		conn.Close()
+		return nil, fmt.Errorf("handshake: missing challenge nonce")
+	}
+
+	serverPub, _ := crypto.Base64Decode(exchangeParts[0])
+	nonce, _ := crypto.Base64Decode(exchangeParts[1])
+
 	priv, pub, _ := crypto.GenerateKeyPair()
 	sessionKey, _ := crypto.DeriveSharedKey(priv, serverPub)
+
+	// 2. Sign Challenge
+	idPub, idPriv := loadIdentityKeys()
+	sig := crypto.Sign(idPriv, nonce)
 
 	// 2. Send CLIENT_HELLO
 	identity := "unknown"
@@ -134,7 +161,13 @@ func Connect(nickname, address string) (*Client, error) {
 		identity = strings.Split(conn.LocalAddr().String(), ":")[0]
 	}
 
-	hello := fmt.Sprintf("CLIENT_HELLO:%s:%s:%s", crypto.Base64Encode(pub), nickname, identity)
+	hello := fmt.Sprintf("CLIENT_HELLO:%s:%s:%s:%s:%s",
+		crypto.Base64Encode(pub),
+		nickname,
+		identity,
+		crypto.Base64Encode(idPub),
+		crypto.Base64Encode(sig))
+
 	if err := protocol.SendFrame(conn, []byte(hello)); err != nil {
 		return nil, fmt.Errorf("handshake: CLIENT_HELLO send failed: %w", err)
 	}
@@ -162,10 +195,13 @@ func Connect(nickname, address string) (*Client, error) {
 		SessionKey:         sessionKey,
 		BroadcastKey:       broadcastKey,
 		Messages:           []string{},
+		Nickname:           nickname,
 		SendChan:           make(chan protocol.ChatMessage, 10),
 		UpdateChan:         make(chan protocol.ChatMessage, 200),
 		PendingDownloadDir: make(chan string, 10), // buffered so TUI never blocks
 		sharedFiles:        make(map[string]string),
+		SigningPub:         idPub,
+		SigningPriv:        idPriv,
 	}
 
 	go client.readPump()
@@ -237,13 +273,19 @@ func (c *Client) readPump() {
 			continue
 		}
 
+		if msg.Type == config.MsgTypePing {
+			pongMsg := protocol.CreateMessage(config.MsgTypePong, "", c.Nickname)
+			c.SendChan <- pongMsg
+			continue
+		}
+
 		if msg.Type == config.MsgTypeDownloadReq {
 			// Server is requesting a file from us for another user
 			parts := strings.SplitN(msg.Content, "|", 2)
 			if len(parts) == 2 {
 				filename := parts[0]
 				requester := parts[1]
-				
+
 				path, ok := c.sharedFiles[filename]
 				if ok {
 					fn, b64, err := CreateMediaTarBase64(path)

@@ -26,25 +26,25 @@ type MediaEntry struct {
 
 // EventEntry is a single real-time notification in the dashboard feed.
 type EventEntry struct {
-	Time  time.Time
-	Icon  string
-	Text  string
+	Time time.Time
+	Icon string
+	Text string
 }
 
 type Server struct {
-	ClientManager     *ClientManager
-	DBManager         *MemoryManager
-	BlacklistDB       *MemoryManager
-	MediaDB           sync.Map // map[string]*MediaEntry
-	BroadcastKey      []byte
-	Running           bool
-	mu                sync.RWMutex
-	Listener          net.Listener
-	ConsoleHistory    []string
-	Stats             ServerStats
-	EventLog          []EventEntry // ring buffer of real-time notifications
-	BlacklistMap      map[string]string // Identity -> Nickname (Metadata)
-	WhitelistMap      map[string]bool   // Identity -> bool
+	ClientManager  *ClientManager
+	DBManager      *MemoryManager
+	BlacklistDB    *MemoryManager
+	MediaDB        sync.Map // map[string]*MediaEntry
+	BroadcastKey   []byte
+	Running        bool
+	mu             sync.RWMutex
+	Listener       net.Listener
+	ConsoleHistory []string
+	Stats          ServerStats
+	EventLog       []EventEntry      // ring buffer of real-time notifications
+	BlacklistMap   map[string]string // Identity -> Nickname (Metadata)
+	WhitelistMap   map[string]bool   // Identity -> bool
 }
 
 type ServerStats struct {
@@ -70,7 +70,7 @@ func (s *Server) ApproveClient(nickname string) bool {
 	s.WhitelistMap[target.Identity] = true
 	delete(s.BlacklistMap, target.Identity)
 	s.mu.Unlock()
-	
+
 	s.SendSystemMessage(target, "✅ You have been approved by an admin. Welcome!")
 	s.Log("Admin approved: " + nickname)
 	s.AddEvent("✅", "Admin approved: "+nickname+" → CHAT ROOM")
@@ -106,10 +106,10 @@ func NewServer() *Server {
 	// Try all known hostname file locations in order of priority.
 	// CONNER_WORKDIR is set by entrypoint.sh via /etc/profile.d/conner.sh
 	candidates := []string{
-		"hostname",                                    // relative to CWD (dev)
-		"/var/lib/tor/conner_chat/hostname",           // Alpine install (entrypoint.sh)
-		"/var/lib/tor/hidden_service/hostname",        // generic Tor install
-		"/var/lib/tor/onion/hostname",                 // alternate name
+		"hostname",                             // relative to CWD (dev)
+		"/var/lib/tor/conner_chat/hostname",    // Alpine install (entrypoint.sh)
+		"/var/lib/tor/hidden_service/hostname", // generic Tor install
+		"/var/lib/tor/onion/hostname",          // alternate name
 	}
 	if workdir := os.Getenv("CONNER_WORKDIR"); workdir != "" {
 		// filepath.Clean removes any path traversal sequences (../../etc)
@@ -206,7 +206,7 @@ func (s *Server) Start(port string) error {
 	s.Listener = ln
 	s.Log(fmt.Sprintf("Server started on port %s", port))
 
-	// Background TTL loop
+	// Background loops
 	go func() {
 		for s.Running {
 			time.Sleep(1 * time.Minute)
@@ -214,6 +214,29 @@ func (s *Server) Start(port string) error {
 			p2 := s.BlacklistDB.CleanupOldMessages()
 			if p1+p2 > 0 {
 				s.Log(fmt.Sprintf("TTL: Purged %d expired messages", p1+p2))
+			}
+		}
+	}()
+
+	// Heartbeat loop: Ping all clients every 30s
+	go func() {
+		for s.Running {
+			time.Sleep(30 * time.Second)
+			pingMsg := protocol.CreateMessage(config.MsgTypePing, "", "SERVER")
+			encoded, _ := pingMsg.ToJSON()
+
+			for _, c := range s.ClientManager.GetAllClients() {
+				if time.Since(c.LastSeen) > 90*time.Second {
+					s.Log(fmt.Sprintf("Heartbeat timeout: %s (%s)", c.Nickname, c.Address))
+					c.Conn.Close()
+					continue
+				}
+				// Encrypt ping with broadcast key (all server broadcasts use this)
+				enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(encoded))
+				select {
+				case c.SendChan <- crypto.Base64Encode(enc):
+				default:
+				}
 			}
 		}
 	}()
@@ -242,14 +265,17 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// a goroutine forever by never completing the exchange.
 	conn.SetDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
 
-	// Key Exchange
+	// Key Exchange + Challenge
 	priv, pub, err := crypto.GenerateKeyPair()
 	if err != nil {
 		conn.Close()
 		return
 	}
-	
-	protocol.SendFrame(conn, []byte(fmt.Sprintf("KEY_EXCHANGE:%s", crypto.Base64Encode(pub))))
+
+	nonce := crypto.GenerateRandomKey() // 32-byte nonce
+	protocol.SendFrame(conn, []byte(fmt.Sprintf("KEY_EXCHANGE:%s|%s",
+		crypto.Base64Encode(pub),
+		crypto.Base64Encode(nonce))))
 
 	payload, err := protocol.ReadFrame(conn)
 	if err != nil {
@@ -262,19 +288,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	
-	parts := strings.SplitN(line, ":", 4)
-	if len(parts) != 4 {
+
+	parts := strings.SplitN(line, ":", 6)
+	if len(parts) != 6 {
 		conn.Close()
 		return
 	}
-	
+
 	clientPubBytes, err := crypto.Base64Decode(parts[1])
 	if err != nil {
 		conn.Close()
 		return
 	}
-	
+
 	sessionKey, err := crypto.DeriveSharedKey(priv, clientPubBytes)
 	if err != nil {
 		conn.Close()
@@ -283,6 +309,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	nickname := parts[2]
 	identity := parts[3]
+	clientSigningPub, _ := crypto.Base64Decode(parts[4])
+	clientSig, _ := crypto.Base64Decode(parts[5])
+
+	// Verify Identity Signature
+	if !crypto.Verify(clientSigningPub, nonce, clientSig) {
+		_ = protocol.SendFrame(conn, []byte("ERROR:Identity verification failed (bad signature)"))
+		conn.Close()
+		return
+	}
 
 	// Check persistent maps BEFORE creating client
 	s.mu.RLock()
@@ -313,6 +348,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		EncryptionKey: sessionKey,
 		State:         "PENDING",
 		SendChan:      make(chan string, 100),
+		LastSeen:      time.Now(),
+		SigningPubKey: clientSigningPub,
 	}
 
 	if isAutoApproved {
@@ -342,14 +379,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if client.State == "WHITELISTED" {
 		s.SendSystemMessage(client, "✅ You have been approved by an admin!")
 		s.BroadcastUserList()
-		
+
 		// Log join to history
 		joinMsg := fmt.Sprintf("➜ %s joined the chat", nickname)
 		s.DBManager.SaveMessage(config.MsgTypeJoin, joinMsg, "SERVER")
-		
+
 		s.Log(fmt.Sprintf("Auto-approved user: %s (%s)", nickname, remoteAddr))
 		s.AddEvent("✅", fmt.Sprintf("Auto-approved: %s (%s)", nickname, remoteAddr))
-		
+
 		// Broadcast join to others
 		bMsg := protocol.CreateMessage(config.MsgTypeJoin, joinMsg, "SERVER")
 		s.BroadcastToState("WHITELISTED", bMsg, remoteAddr)
@@ -374,6 +411,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		if err != nil {
 			break
 		}
+		client.LastSeen = time.Now()
 		s.processClientMessage(client, string(payload))
 	}
 
@@ -387,14 +425,14 @@ func (s *Server) removeClient(client *Client) {
 	// channel so the range loop terminates. This avoids the race between
 	// two goroutines reading from the same channel simultaneously.
 	client.Conn.Close()
-	
+
 	if client.State == "WHITELISTED" {
 		leaveMsg := fmt.Sprintf("⇠ %s left the chat", client.Nickname)
 		s.DBManager.SaveMessage(config.MsgTypeJoin, leaveMsg, "SERVER")
-		
+
 		bMsg := protocol.CreateMessage(config.MsgTypeJoin, leaveMsg, "SERVER")
 		s.BroadcastToState(client.State, bMsg, client.Address)
-		
+
 		s.Log(fmt.Sprintf("Client disconnected: %s (%s)", client.Nickname, client.Address))
 		s.AddEvent("🔴", fmt.Sprintf("Disconnected: %s [%s]", client.Nickname, client.State))
 		s.BroadcastUserList()
@@ -408,7 +446,7 @@ func (s *Server) SendSystemMessage(client *Client, content string) {
 	msg := protocol.CreateMessage(config.MsgTypeSystem, content, "SERVER")
 	msgJSON, _ := msg.ToJSON()
 	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
-	
+
 	select {
 	case client.SendChan <- crypto.Base64Encode(enc):
 	default:
@@ -419,7 +457,7 @@ func (s *Server) SendSystemMessage(client *Client, content string) {
 func (s *Server) SendMessage(client *Client, msg protocol.ChatMessage) {
 	msgJSON, _ := msg.ToJSON()
 	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
-	
+
 	select {
 	case client.SendChan <- crypto.Base64Encode(enc):
 	default:
@@ -438,7 +476,7 @@ func (s *Server) processClientMessage(client *Client, text string) {
 	if err != nil {
 		return
 	}
-	
+
 	msg, err := protocol.FromJSON(string(decryptedBytes))
 	if err != nil {
 		return
@@ -450,13 +488,17 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return
 	}
 
+	if msg.Type == config.MsgTypePong {
+		return // LastSeen was already updated in the read pump
+	}
+
 	if msg.Type == config.MsgTypeMediaRegister {
 		parts := strings.SplitN(msg.Content, "|", 3)
 		if len(parts) == 3 {
 			id := parts[1]
 			filename := parts[0]
 			metadata := parts[2]
-			
+
 			entry := &MediaEntry{
 				ID:         id,
 				Filename:   filename,
@@ -465,7 +507,7 @@ func (s *Server) processClientMessage(client *Client, text string) {
 				Metadata:   metadata,
 			}
 			s.MediaDB.Store(id, entry)
-			
+
 			info := fmt.Sprintf("[FILE] %s shared: %s (ID: %s) — /download %s", client.Nickname, filename, id, id)
 			bmsg := protocol.CreateMessage(config.MsgTypeMediaInfo, info, "SERVER")
 			s.BroadcastToState(client.State, bmsg, "")
@@ -481,7 +523,7 @@ func (s *Server) processClientMessage(client *Client, text string) {
 			filename := parts[0]
 			data := parts[1]
 			targetNick := parts[2]
-			
+
 			target := s.ClientManager.GetClientByNickname(targetNick)
 			if target != nil {
 				resp := protocol.CreateMessage(config.MsgTypeMediaData, filename+"|"+data, "SERVER")
@@ -532,7 +574,7 @@ func (s *Server) processClientMessage(client *Client, text string) {
 	}
 
 	client.MessageCount++
-	
+
 	switch client.State {
 	case "WHITELISTED":
 		s.DBManager.SaveMessage(config.MsgTypeChat, msg.Content, client.Nickname)
@@ -592,7 +634,7 @@ func (s *Server) handleCommand(client *Client, content string) {
 			annText := strings.Join(parts[1:], " ")
 			fullText := fmt.Sprintf("📢 ANNOUNCEMENT: %s", annText)
 			annMsg := protocol.CreateMessage(config.MsgTypeSystem, fullText, "ADMIN")
-			
+
 			s.DBManager.SaveMessage(config.MsgTypeSystem, fullText, "ADMIN")
 			s.BroadcastToState(client.State, annMsg, "")
 			s.Log(fmt.Sprintf("[ANN] %s: %s", client.Nickname, annText))
@@ -655,16 +697,16 @@ func (s *Server) BroadcastUserList() {
 	}
 	userList := strings.Join(users, ",")
 	msg := protocol.CreateMessage(config.MsgTypeUserList, userList, "SERVER")
-	
+
 	// Broadcast to everyone so their sidebars update
 	s.mu.RLock()
 	clients := s.ClientManager.GetAllClients()
 	s.mu.RUnlock()
-	
+
 	msgJSON, _ := msg.ToJSON()
 	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
 	payload := crypto.Base64Encode(enc)
-	
+
 	for _, c := range clients {
 		select {
 		case c.SendChan <- payload:
@@ -689,9 +731,8 @@ func (s *Server) BroadcastToState(state string, msg protocol.ChatMessage, exclud
 			}
 		}
 	}
-	
+
 	s.mu.Lock()
 	s.Stats.MessagesSent += sentCount
 	s.mu.Unlock()
 }
-

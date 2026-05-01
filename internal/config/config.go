@@ -28,6 +28,8 @@ const (
 	MsgTypePrivate = "PRIVATE"
 	MsgTypeSystem  = "SYSTEM"
 	MsgTypeError   = "ERROR"
+	MsgTypePing    = "PING"
+	MsgTypePong    = "PONG"
 	MsgTypeUserList = "USER_LIST"
 	MsgTypeMediaInfo = "MEDIA_INFO"
 	MsgTypeMediaData = "MEDIA_DATA"

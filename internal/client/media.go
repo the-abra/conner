@@ -2,6 +2,7 @@ package client
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -34,7 +35,8 @@ func CreateMediaTarBase64(path string) (string, string, error) {
 	defer os.Remove(tmpName)
 	defer tmpFile.Close()
 
-	tw := tar.NewWriter(tmpFile)
+	gw := gzip.NewWriter(tmpFile)
+	tw := tar.NewWriter(gw)
 	baseDir := filepath.Dir(absPath)
 
 	walkErr := filepath.Walk(absPath, func(p string, i os.FileInfo, e error) error {
@@ -79,6 +81,9 @@ func CreateMediaTarBase64(path string) (string, string, error) {
 	if err := tw.Close(); err != nil {
 		return "", "", fmt.Errorf("tar close: %w", err)
 	}
+	if err := gw.Close(); err != nil {
+		return "", "", fmt.Errorf("gzip close: %w", err)
+	}
 
 	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
 		return "", "", fmt.Errorf("seek: %w", err)
@@ -112,8 +117,14 @@ func ExtractMediaTarBase64(base64Data string, destDir string) (string, error) {
 		return "", fmt.Errorf("mkdir %q: %w", absBase, err)
 	}
 
+	gr, err := gzip.NewReader(strings.NewReader(string(tarData)))
+	if err != nil {
+		return "", fmt.Errorf("gzip read: %w", err)
+	}
+	defer gr.Close()
+
 	var firstPath string
-	tr := tar.NewReader(strings.NewReader(string(tarData)))
+	tr := tar.NewReader(gr)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {

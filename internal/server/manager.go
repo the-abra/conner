@@ -17,6 +17,8 @@ type Client struct {
 	MessageCount  int
 	SendChan      chan string
 	IsAdmin       bool
+	LastSeen      time.Time
+	SigningPubKey []byte
 }
 
 type ClientManager struct {

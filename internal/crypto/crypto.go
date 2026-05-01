@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"crypto/ed25519"
 	"errors"
 	"io"
 
@@ -79,4 +80,19 @@ func Base64Encode(data []byte) string {
 
 func Base64Decode(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
+}
+
+// GenerateSigningKeyPair generates an Ed25519 keypair for identity
+func GenerateSigningKeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	return ed25519.GenerateKey(rand.Reader)
+}
+
+// Sign signs data using Ed25519
+func Sign(privateKey ed25519.PrivateKey, data []byte) []byte {
+	return ed25519.Sign(privateKey, data)
+}
+
+// Verify verifies an Ed25519 signature
+func Verify(publicKey ed25519.PublicKey, data []byte, signature []byte) bool {
+	return ed25519.Verify(publicKey, data, signature)
 }

@@ -17,7 +17,7 @@ func main() {
 		os.Exit(1)
 	}
 	nickname := os.Args[1]
-	
+
 	address := "127.0.0.1:6666" // default
 	if len(os.Args) >= 3 {
 		address = os.Args[2]
