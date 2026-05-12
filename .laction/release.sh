@@ -1,46 +1,34 @@
-#!/usr/bin/env sh
-# .laction/release.sh — Cross-Platform Release (errors only)
+#!/bin/sh
 set -e
 
-# Load shared setup
-. "$(dirname "$0")/setup.sh"
+# Colors
+MAGENTA='\033[0;35m'
+GREEN='\033[0;32m'
+NC='\033[0m'
 
-log_info "Starting cross-platform release build..."
-mkdir -p bin
+mkdir -p bin/release
 
-build_target() {
-    GOOS="$1"
-    GOARCH="$2"
-    SUFFIX="$3"
-    EXT=""
-    [ "$GOOS" = "windows" ] && EXT=".exe"
+echo "${MAGENTA}===> Starting Cross-Platform Release Build...${NC}"
 
-    log_info "Building for ${GOOS}/${GOARCH} (${SUFFIX})..."
+# Linux amd64
+echo "  • Building linux/amd64..."
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/release/conner-linux-amd64 ./cmd/conner/main.go
 
-    # Server
-    if ! GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 \
-        go build -ldflags="-s -w" \
-        -o "bin/conner-server-${SUFFIX}${EXT}" ./cmd/server/main.go >/dev/null 2>&1; then
-        log_error "Failed to build server for ${SUFFIX}"
-        return 1
-    fi
+# Linux arm64
+echo "  • Building linux/arm64..."
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/release/conner-linux-arm64 ./cmd/conner/main.go
 
-    # Client
-    if ! GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 \
-        go build -ldflags="-s -w" \
-        -o "bin/conner-client-${SUFFIX}${EXT}" ./cmd/client/main.go >/dev/null 2>&1; then
-        log_error "Failed to build client for ${SUFFIX}"
-        return 1
-    fi
-    
-    log_success "Built ${SUFFIX} binaries"
-}
+# Windows amd64
+echo "  • Building windows/amd64..."
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o bin/release/conner-windows-amd64.exe ./cmd/conner/main.go
 
-# Define targets
-build_target linux   amd64  linux-amd64
-build_target linux   arm64  linux-arm64
-build_target darwin  amd64  darwin-amd64
-build_target darwin  arm64  darwin-arm64
-build_target windows amd64  windows-amd64
+# Darwin amd64 (Intel Mac)
+echo "  • Building darwin/amd64..."
+GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o bin/release/conner-darwin-amd64 ./cmd/conner/main.go
 
-log_success "All release binaries generated in bin/"
+# Darwin arm64 (Apple Silicon)
+echo "  • Building darwin/arm64..."
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o bin/release/conner-darwin-arm64 ./cmd/conner/main.go
+
+echo "${GREEN}✓ Release artifacts generated in bin/release/:${NC}"
+ls -lh bin/release/

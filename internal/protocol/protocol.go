@@ -1,23 +1,15 @@
 package protocol
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 )
 
-type ChatMessage struct {
-	Type      string `json:"type"`
-	Content   string `json:"content"`
-	Sender    string `json:"sender"`
-	Timestamp string `json:"timestamp"`
-	IsAdmin   bool   `json:"is_admin,omitempty"` // sender was an admin at send time
-	Signature string `json:"signature,omitempty"`
-}
-
-func CreateMessage(msgType, content, sender string) ChatMessage {
-	return ChatMessage{
+func CreateMessage(msgType, content, sender string) *ChatMessage {
+	return &ChatMessage{
 		Type:      msgType,
 		Content:   content,
 		Sender:    sender,
@@ -25,14 +17,13 @@ func CreateMessage(msgType, content, sender string) ChatMessage {
 	}
 }
 
-func (c *ChatMessage) ToJSON() (string, error) {
-	b, err := json.Marshal(c)
-	return string(b), err
+func (c *ChatMessage) Encode() ([]byte, error) {
+	return proto.Marshal(c)
 }
 
-func FromJSON(data string) (ChatMessage, error) {
-	var msg ChatMessage
-	err := json.Unmarshal([]byte(data), &msg)
+func Decode(data []byte) (*ChatMessage, error) {
+	msg := &ChatMessage{}
+	err := proto.Unmarshal(data, msg)
 	return msg, err
 }
 

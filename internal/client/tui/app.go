@@ -2,14 +2,15 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"conner/internal/client"
 	"conner/internal/config"
 	"conner/internal/protocol"
-	"path/filepath"
 
+	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -85,7 +86,7 @@ var (
 
 // ─── Message types ────────────────────────────────────────────────────────────
 
-type incomingMsg protocol.ChatMessage
+type incomingMsg *protocol.ChatMessage
 type uploadDoneMsg struct {
 	err      error
 	filename string
@@ -95,27 +96,34 @@ type uploadDoneMsg struct {
 // ─── Model ────────────────────────────────────────────────────────────────────
 
 type model struct {
-	cli         *client.Client
-	nickname    string
-	width       int
-	height      int
-	input       textinput.Model
-	viewport    viewport.Model
-	lines       []string // rendered lines in the viewport
-	showHelp    bool
-	isUploading bool
-	state       string // PENDING, WHITELISTED
-	onlineUsers []string
-	isAdmin     bool
+	cli            *client.Client
+	nickname       string
+	width          int
+	height         int
+	input          textinput.Model
+	viewport       viewport.Model
+	fp             filepicker.Model
+	showFilePicker bool
+	lines          []string // rendered lines in the viewport
+	showHelp       bool
+	isUploading    bool
+	state          string // PENDING, WHITELISTED
+	onlineUsers    []string
+	isAdmin        bool
 }
 
 func InitialModel(c *client.Client, nick string) tea.Model {
+	fp := filepicker.New()
+	fp.AllowedTypes = []string{} // allow all
+	fp.CurrentDirectory, _ = os.Getwd()
+
 	m := &model{
 		cli:      c,
 		nickname: nick,
 		input:    textinput.New(),
 		viewport: viewport.New(0, 0),
 		state:    "PENDING",
+		fp:       fp,
 	}
 	if c == nil {
 		m.state = "BANNED"
@@ -140,7 +148,10 @@ func (m model) waitForMsg() tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		return incomingMsg(<-m.cli.UpdateChan)
+		return func() incomingMsg {
+			msg := <-m.cli.UpdateChan
+			return msg
+		}()
 	}
 }
 
@@ -180,8 +191,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if msg.Type != config.MsgTypeUserList {
-			m.appendLine(m.renderMessage(protocol.ChatMessage(msg)))
-			m.refreshViewport()
+			rendered := m.renderMessage(msg)
+			if rendered != "" {
+				m.appendLine(rendered)
+				m.refreshViewport()
+			}
 		}
 		cmds = append(cmds, m.waitForMsg())
 		return m, tea.Batch(cmds...)
@@ -204,6 +218,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
+		if m.showFilePicker {
+			switch msg.String() {
+			case "ctrl+c", "esc":
+				m.showFilePicker = false
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.fp, cmd = m.fp.Update(msg)
+			if didSelect, path := m.fp.DidSelectFile(msg); didSelect {
+				m.showFilePicker = false
+				m.appendSystem("⏳ Creating Tor Ephemeral Service for " + path + "...")
+				go func() {
+					err := m.cli.SendFile(path)
+					if err != nil {
+						msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Share failed: "+err.Error(), "SYSTEM")
+						m.cli.UpdateChan <- msg
+					}
+				}()
+			}
+			return m, cmd
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
@@ -278,6 +314,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Width = msg.Width - 6
 		m.viewport.Width = msg.Width - 2
 		m.viewport.Height = msg.Height - 6
+		m.fp.Height = msg.Height - 6
 		m.refreshViewport()
 	}
 
@@ -298,20 +335,36 @@ func (m *model) handleInput(val string) tea.Cmd {
 		m.showHelp = true
 		return nil
 
-	case strings.HasPrefix(val, "/upload"):
+	case val == "/burn":
+		m.appendSystem("🔥 Initiating Panic Switch...")
+		m.refreshViewport()
+		go func() {
+			os.RemoveAll("downloads")
+			os.Remove("identity.key")
+			os.Exit(0)
+		}()
+		return nil
+
+	case strings.HasPrefix(val, "/share") || strings.HasPrefix(val, "/upload") || strings.HasPrefix(val, "/send"):
 		parts := strings.SplitN(val, " ", 2)
 		if len(parts) == 2 {
+			// Direct send
 			path := parts[1]
-			if err := m.cli.RegisterFile(path); err != nil {
-				m.appendSystem("✗ Upload failed: " + err.Error())
-			} else {
-				m.appendSystem("✓ File registered for sharing: " + filepath.Base(path))
-			}
-			m.refreshViewport()
+			m.appendSystem("⏳ Creating Tor Ephemeral Service for " + path + "...")
+			go func() {
+				err := m.cli.SendFile(path)
+				if err != nil {
+					msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Send failed: "+err.Error(), "SYSTEM")
+					m.cli.UpdateChan <- msg
+				}
+			}()
 		} else {
-			m.appendSystem("Usage: /upload <file-path>")
-			m.refreshViewport()
+			// Show picker
+			m.showFilePicker = true
+			m.input.SetValue("")
+			m.fp.Init()
 		}
+		return nil
 
 	case strings.HasPrefix(val, "/download"):
 		parts := strings.SplitN(val, " ", 2)
@@ -319,10 +372,15 @@ func (m *model) handleInput(val string) tea.Cmd {
 			fileID := parts[1]
 			m.appendSystem("⬇  Requesting " + fileID + "…")
 			m.refreshViewport()
-			// Push fixed "downloads" dir
-			m.cli.PendingDownloadDir <- "downloads"
-			reqMsg := protocol.CreateMessage(config.MsgTypeDownloadReq, fileID, m.nickname)
-			m.cli.SendChan <- reqMsg
+			go func() {
+				err := m.cli.DownloadSharedFile(fileID, "downloads")
+				if err != nil {
+					// We can't safely call m.appendSystem from another goroutine,
+					// so we send a system message to UpdateChan
+					msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Download failed: "+err.Error(), "SYSTEM")
+					m.cli.UpdateChan <- msg
+				}
+			}()
 		} else {
 			m.appendSystem("Usage: /download <id>")
 			m.refreshViewport()
@@ -365,14 +423,23 @@ func (m *model) refreshViewport() {
 //   - Own chat message         → purple name, white body
 //   - Other chat messages      → blue name, white body
 //   - Timestamp                → shown only when msg.IsAdmin == true
-func (m model) renderMessage(msg protocol.ChatMessage) string {
+func (m model) renderMessage(msg *protocol.ChatMessage) string {
 	switch msg.Type {
-	case config.MsgTypeSystem, config.MsgTypeJoin:
+	case config.MsgTypeSystem, config.MsgTypeJoin, config.MsgTypeFileOffer:
 		// Minimalist system line — just orange text, no heavy formatting
 		return styleSystem.Render("  · " + msg.Content)
 
 	case config.MsgTypeMediaInfo:
 		return styleSystem.Render("  · " + msg.Content)
+
+	case config.MsgTypeMediaData:
+		// When a download finishes, we get a media data event with the file path
+		sixelStr := TryRenderSixel(msg.Content)
+		if sixelStr != "" {
+			return sixelStr
+		}
+		// If it's not an image or fails, don't show an extra line
+		return ""
 
 	case config.MsgTypePrivate:
 		// Private messages: teal accent
@@ -416,6 +483,13 @@ func (m model) renderSelf(content string) string {
 func (m model) View() string {
 	if m.width == 0 {
 		return "Connecting…"
+	}
+
+	if m.showFilePicker {
+		header := styleTitleBar.Width(m.width).Render("📂 Select File to Share")
+		body := m.fp.View()
+		footer := styleDim.Render("\n(esc to cancel)")
+		return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 	}
 
 	// ── Overlay: PENDING ──────────────────────────────────────────────────
@@ -533,8 +607,9 @@ func (m model) View() string {
   ─────────────────────────────────────
   /list              List online users
   /private <u> <msg> Send private message
-  /upload <path>     Share a file/folder
+  /share             Share a file/folder via P2P
   /download <id>     Download a file
+  /burn              Panic switch: wipe identity & files
 %s  /help              Show this menu
   /quit              Disconnect
 

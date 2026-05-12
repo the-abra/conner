@@ -1,25 +1,24 @@
-#!/usr/bin/env sh
-# .laction/security.sh — gosec Scan (errors only)
+#!/bin/sh
 set -e
 
-# Load shared setup
-. "$(dirname "$0")/setup.sh"
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
 
-log_info "Starting security scan with gosec..."
+echo "${YELLOW}===> Initiating Security Scan (gosec)...${NC}"
 
-# Install gosec only if not already in PATH
+# Check if gosec is installed
 if ! command -v gosec >/dev/null 2>&1; then
-    log_info "Installing gosec..."
-    apk add gosec >/dev/null 2>&1
+    echo "  • ${YELLOW}gosec not found. Installing...${NC}"
+    # Install to GOBIN
+    go install github.com/securego/gosec/v2/cmd/gosec@latest
 fi
 
-# Run gosec
-# -exclude=G204,G304: matched existing suppression
-# -severity medium: show medium and high
-log_info "Running gosec scan..."
-if ! gosec -exclude=G204,G304 -severity medium ./... 2>&1 | grep -E "^\[" >&2; then
-    # No findings or grep didn't find anything (which is GOOD)
-    log_success "No high/medium severity security issues found."
-else
-    log_warn "Security findings detected (see above)."
-fi
+echo "  • Running scan..."
+# Run gosec on the current directory
+# -exclude-dir=.laction excludes this script directory
+gosec -fmt=sarif -out=security-report.sarif -exclude-dir=.laction ./...
+
+echo "${GREEN}✓ Security scan completed successfully.${NC}"

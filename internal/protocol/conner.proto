@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package protocol;
+
+option go_package = "conner/internal/protocol";
+
+message ChatMessage {
+    string type = 1;
+    string content = 2;
+    string sender = 3;
+    string timestamp = 4;
+    bool is_admin = 5;
+    string signature = 6;
+    string pub_key = 7;
+    bool is_e2ee = 8;
+    string reply_to = 9;
+    repeated string mentions = 10;
+    string file_id = 11;
+    int32 chunk_idx = 12;
+    int32 total_chunks = 13;
+    string onion_addr = 14;
+    uint32 ratchet_step = 15;
+}

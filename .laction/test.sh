@@ -1,21 +1,12 @@
-#!/usr/bin/env sh
-# .laction/test.sh — Test (errors only)
+#!/bin/sh
 set -e
 
-# Load shared setup
-. "$(dirname "$0")/setup.sh"
+# Colors
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+NC='\033[0m'
 
-log_info "Starting tests (race detector enabled)..."
+echo "${CYAN}===> Running tests with Race Detector...${NC}"
+go test -v -race ./...
 
-# Run tests, capture failure patterns
-# We use a temporary file to capture output so we can check if anything failed
-TEST_LOG=$(mktemp)
-trap 'rm -f "$TEST_LOG"' EXIT
-
-if go test -race -coverprofile=coverage.out ./... > "$TEST_LOG" 2>&1; then
-    log_success "All tests passed!"
-else
-    log_error "Tests failed. Showing relevant errors:"
-    grep -E "^(FAIL|---\s+FAIL|panic|#)" "$TEST_LOG" >&2
-    exit 1
-fi
+echo "${GREEN}✓ Tests completed successfully.${NC}"

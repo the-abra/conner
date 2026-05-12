@@ -19,6 +19,7 @@ type Client struct {
 	IsAdmin       bool
 	LastSeen      time.Time
 	SigningPubKey []byte
+	E2EPubKey     []byte
 }
 
 type ClientManager struct {

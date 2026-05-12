@@ -1,37 +1,18 @@
-#!/usr/bin/env sh
-# .laction/build.sh — Build & Vet (errors only)
+#!/bin/sh
 set -e
 
-# Load shared setup
-. "$(dirname "$0")/setup.sh"
+# Colors
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
 
-log_info "Starting Build & Vet process..."
+echo "${BLUE}===> [1/3] Tidying modules...${NC}"
+go mod tidy
 
-# 1. Vet
-log_info "Running go vet..."
-# Capture errors/warnings and send to stderr
-if ! go vet ./... 2>&1 | grep -i "error\|fail\|warning" >&2; then
-    # grep returning 1 means no matches found, which is GOOD for vet
-    true
-fi
+echo "${BLUE}===> [2/3] Running go vet...${NC}"
+go vet ./...
 
-# 2. Build
-log_info "Building server and client..."
-rm -rf bin
-mkdir -p bin
+echo "${BLUE}===> [3/3] Compilation check...${NC}"
+CGO_ENABLED=0 go build -o conner ./cmd/conner/main.go
 
-if go build -ldflags="-s -w" -o bin/conner-server ./cmd/server/main.go >/dev/null 2>&1; then
-    log_success "Server built: bin/conner-server"
-else
-    log_error "Failed to build server"
-    exit 1
-fi
-
-if go build -ldflags="-s -w" -o bin/conner-client ./cmd/client/main.go >/dev/null 2>&1; then
-    log_success "Client built: bin/conner-client"
-else
-    log_error "Failed to build client"
-    exit 1
-fi
-
-log_success "Build & Vet completed successfully."
+echo "${GREEN}✓ Build & Vet completed successfully.${NC}"

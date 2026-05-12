@@ -18,16 +18,11 @@ rc-update del syslog boot
 rc-service syslog stop
 find /var/log -type f -exec truncate -s 0 {} \;
 ```
-The `scripts/anti_forensics.sh` script automates this by linking log files to `/dev/null` and setting up `tmpfs` mounts for `/var/log` and `/tmp`.
 
 ## 3. Application Setup & Network Hardening
 
 ### NGINX Reverse Proxy (TCP Stream Mode)
-CONNER communicates via raw TCP sockets with custom framing. The proxy must be configured to pass TCP streams without HTTP headers, and it must keep no logs.
-
-> [!CAUTION]
-> **Important Note on Binaries:**
-> If you are using pre-compiled binaries from the release page, ensure you rename the architecture-specific file (e.g., `conner-server-linux-amd64`) to **`conner-server`**. The restricted shell and installation scripts are hardcoded to look for this exact filename.
+CONNER communicates via raw TCP sockets. The proxy passes TCP streams without HTTP headers and keeps no logs.
 
 ```nginx
 stream {
@@ -35,37 +30,33 @@ stream {
         listen 80;
         listen [::]:80;
         proxy_pass 127.0.0.1:6666;
-        proxy_buffer_size 128k;
     }
 }
 ```
 
 ### Tor Hidden Service
-Hosting as a Tor Hidden Service hides the server's IP address and provides end-to-end encryption by default.
-*   The `install-server.sh` script automatically configures Tor to point to port 80 (NGINX), which forwards to 6666 (Go Server).
-*   **Important**: Tor logs are redirected to `/dev/null` (`Log err file /dev/null`) to leave no footprint.
+The server should only be accessible via Tor to hide its physical location.
 
-### Restricted Shell Environment
-The application runs under a restricted user (`conner`) using a custom shell.
-*   The user cannot execute system commands like `ls`, `cd`, or `su`.
-*   They are only allowed to run `conner-server` and view the `.onion` address.
-*   Execution rights to critical package managers (`apk`) and privilege escalation tools (`sudo`) are removed for this user.
+```fortran
+# /etc/tor/torrc
+HiddenServiceDir /var/lib/tor/conner_chat/
+HiddenServicePort 80 127.0.0.1:80
+```
 
-## 4. Usage & Operational Privacy
+## 4. Shielded Execution Environment
 
-### Server Administrator Guidelines
-*   **Shadow Banning**: Use `/block <nick>` to silently redirect "troll" or suspicious users to the Shadow Room. They will see "Approved by bot" and think they are in, but they will be isolated from your main community.
-*   **Persistent Blacklist**: Shadow bans persist across reconnects by IP and Nickname.
-*   **Purge command**: Use `/purge` in the admin panel to immediately wipe all message history from RAM.
+CONNER includes a restricted shell (`conner-shell`) to prevent lateral movement if the application is compromised.
 
-### Client User Guidelines
-*   **Client Connections**: The Go client automatically handles SOCKS5 proxying for `.onion` addresses. No local DNS leaks occur.
-*   **Hardened Media**: Use `/upload <path>` for files. The system implements path traversal protection (G305) and decompression bomb protection (G110).
-*   **Nicknames**: Do not use identifiable nicknames.
+1. **Restricted Shell**: Users assigned to `conner-shell` can only run `start-server` and `show-onion`.
+2. **Isolation**: The application runs as a non-root `conner` user with no write access to sensitive system directories.
 
-## 5. Security Shield
+## 5. Panic Switch & Data Destruction
 
-The CONNER server implements a **Framed Binary Protocol**:
-*   **Detection:** It uses big-endian 4-byte length headers. Any frame larger than 50MB is immediately rejected.
-*   **Action:** Malicious payloads attempting to overflow buffers or inject shell commands are stopped by the strict Go memory safety and JSON unmarshaling.
-*   **Silent TUI:** The server silences raw stdout/stderr output while the TUI is active, preventing "log bleed" that could be captured by terminal-recording malware.
+In case of a physical or digital breach, use the `/burn` command from any authorized admin client. 
+- **Server-side**: The server should be configured with `shred` to wipe session keys.
+- **Client-side**: The `/burn` command wipes the `identity.key` and `downloads/` directory using multiple passes.
+
+## 6. Maintenance
+
+- **Wipe Free Space**: Regularly run `sfill` or `shred` on unused disk space if not running in RAM-only mode.
+- **Metadata**: Never share screenshots of the TUI that might contain window titles or system clock information.

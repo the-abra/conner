@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -35,7 +36,6 @@ type Server struct {
 	ClientManager  *ClientManager
 	DBManager      *MemoryManager
 	MediaDB        sync.Map // map[string]*MediaEntry
-	BroadcastKey   []byte
 	Running        bool
 	mu             sync.RWMutex
 	Listener       net.Listener
@@ -43,7 +43,7 @@ type Server struct {
 	Stats          ServerStats
 	EventLog       []EventEntry      // ring buffer of real-time notifications
 	BlacklistMap   map[string]string // Identity -> Nickname (Metadata)
-	WhitelistMap   map[string]bool   // Identity -> bool
+	WhitelistMap   map[string]string // SigningPubKey (B64) -> Identity
 	CmdRegistry    *CommandRegistry
 }
 
@@ -66,8 +66,11 @@ func (s *Server) ApproveClient(nickname string) bool {
 		return false
 	}
 	target.State = "WHITELISTED"
+	
+	pubKeyB64 := crypto.Base64Encode(target.SigningPubKey)
+
 	s.mu.Lock()
-	s.WhitelistMap[target.Identity] = true
+	s.WhitelistMap[pubKeyB64] = target.Nickname
 	delete(s.BlacklistMap, target.Identity)
 	s.mu.Unlock()
 	
@@ -127,14 +130,13 @@ func NewServer() *Server {
 	return &Server{
 		ClientManager:  NewClientManager(),
 		DBManager:      NewMemoryManager(config.MessageHistoryLimit, config.MessageTTL),
-		BroadcastKey:   crypto.GenerateRandomKey(),
 		Running:        true,
 		ConsoleHistory: make([]string, 0),
 		EventLog:       make([]EventEntry, 0, 200),
 		Stats:          ServerStats{StartTime: time.Now(), TorAddress: torAddr},
 		CmdRegistry:    NewCommandRegistry(),
 		BlacklistMap:   make(map[string]string),
-		WhitelistMap:   make(map[string]bool),
+		WhitelistMap:   make(map[string]string),
 	}
 }
 
@@ -199,7 +201,7 @@ func (s *Server) DeleteMedia(id string) bool {
 }
 
 func (s *Server) Start(port string) error {
-	ln, err := net.Listen("tcp", ":"+port)
+	ln, err := net.Listen("tcp", "0.0.0.0:"+port)
 	if err != nil {
 		return err
 	}
@@ -222,7 +224,7 @@ func (s *Server) Start(port string) error {
 		for s.Running {
 			time.Sleep(30 * time.Second)
 			pingMsg := protocol.CreateMessage(config.MsgTypePing, "", "SERVER")
-			encoded, _ := pingMsg.ToJSON()
+			encoded, _ := pingMsg.Encode()
 
 			for _, c := range s.ClientManager.GetAllClients() {
 				if time.Since(c.LastSeen) > 90*time.Second {
@@ -230,8 +232,8 @@ func (s *Server) Start(port string) error {
 					c.Conn.Close()
 					continue
 				}
-				// Encrypt ping with broadcast key (all server broadcasts use this)
-				enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(encoded))
+				// Encrypt ping with client's session key
+				enc, _ := crypto.Encrypt(c.EncryptionKey, []byte(encoded))
 				select {
 				case c.SendChan <- crypto.Base64Encode(enc):
 				default:
@@ -251,18 +253,19 @@ func (s *Server) Start(port string) error {
 		s.mu.Lock()
 		s.Stats.TotalConnections++
 		s.mu.Unlock()
+		fmt.Printf("[*] DEBUG: Accept() returned! Handling connection from %s\n", conn.RemoteAddr().String())
 		go s.handleConnection(conn)
 	}
 	return nil
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
-	s.Log(fmt.Sprintf("New connection from %s", remoteAddr))
+	s.Log(fmt.Sprintf("Incoming connection: %s", remoteAddr))
 
-	// Set handshake deadline — prevents a connecting client from holding
-	// a goroutine forever by never completing the exchange.
-	conn.SetDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
+	// Set handshake deadline
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	// Key Exchange + Challenge
 	priv, pub, err := crypto.GenerateKeyPair()
@@ -272,13 +275,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	nonce := crypto.GenerateRandomKey() // 32-byte nonce
-	protocol.SendFrame(conn, []byte(fmt.Sprintf("KEY_EXCHANGE:%s|%s",
+	err = protocol.SendFrame(conn, []byte(fmt.Sprintf("KEY_EXCHANGE:%s|%s|%d",
 		crypto.Base64Encode(pub),
-		crypto.Base64Encode(nonce))))
+		crypto.Base64Encode(nonce),
+		crypto.PoWDifficulty)))
+	if err != nil {
+		s.Log(fmt.Sprintf("Handshake failed: could not send KEY_EXCHANGE to %s: %v", remoteAddr, err))
+		return
+	}
 
 	payload, err := protocol.ReadFrame(conn)
 	if err != nil {
-		conn.Close()
+		s.Log(fmt.Sprintf("Handshake failed: could not read CLIENT_HELLO from %s: %v", remoteAddr, err))
 		return
 	}
 
@@ -288,8 +296,24 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	parts := strings.SplitN(line, ":", 6)
-	if len(parts) != 6 {
+	parts := strings.SplitN(line, ":", 8)
+	if len(parts) != 8 {
+		conn.Close()
+		return
+	}
+
+	// Verify PoW
+	powNonce, _ := crypto.Base64Decode(parts[6])
+	if len(powNonce) != 8 {
+		_ = protocol.SendFrame(conn, []byte("ERROR:Invalid PoW nonce"))
+		conn.Close()
+		return
+	}
+	var powNonceU64 uint64
+	binary.Read(strings.NewReader(string(powNonce)), binary.BigEndian, &powNonceU64)
+
+	if !crypto.VerifyPoW(nonce, powNonceU64, crypto.PoWDifficulty) {
+		_ = protocol.SendFrame(conn, []byte("ERROR:Proof of Work verification failed"))
 		conn.Close()
 		return
 	}
@@ -310,6 +334,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	identity := parts[3]
 	clientSigningPub, _ := crypto.Base64Decode(parts[4])
 	clientSig, _ := crypto.Base64Decode(parts[5])
+	e2ePub, _ := crypto.Base64Decode(parts[7])
 
 	// Verify Identity Signature
 	if !crypto.Verify(clientSigningPub, nonce, clientSig) {
@@ -318,10 +343,26 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
+	pubKeyB64 := crypto.Base64Encode(clientSigningPub)
+
 	// Check persistent maps BEFORE creating client
 	s.mu.RLock()
 	banNick, isBanned := s.BlacklistMap[identity]
-	isAutoApproved := s.WhitelistMap[identity]
+	
+	whitelistedNick := ""
+	isKeyWhitelisted := false
+	for k, v := range s.WhitelistMap {
+		if k == pubKeyB64 {
+			isKeyWhitelisted = true
+			whitelistedNick = v
+		}
+		if v == nickname && k != pubKeyB64 {
+			s.mu.RUnlock()
+			_ = protocol.SendFrame(conn, []byte("ERROR:This nickname is owned by another identity"))
+			conn.Close()
+			return
+		}
+	}
 	s.mu.RUnlock()
 
 	if isBanned {
@@ -349,24 +390,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 		SendChan:      make(chan string, 100),
 		LastSeen:      time.Now(),
 		SigningPubKey: clientSigningPub,
+		E2EPubKey:     e2ePub,
 	}
 
-	if isAutoApproved {
+	if isKeyWhitelisted {
+		client.Nickname = whitelistedNick
 		client.State = "WHITELISTED"
-		s.Log("Auto-approved returning user: " + nickname)
+		s.Log("Auto-approved returning user: " + client.Nickname)
 	}
 
 	s.ClientManager.AddClient(remoteAddr, client)
 
-	// Send the shared BroadcastKey to the client, encrypted with their
-	// unique session key. All group messages are encrypted with BroadcastKey;
-	// the client must have it to decrypt any broadcast or announcement.
-	encBK, err := crypto.Encrypt(sessionKey, s.BroadcastKey)
-	if err != nil {
-		conn.Close()
-		return
-	}
-	if err := protocol.SendFrame(conn, []byte("BROADCAST_KEY:"+crypto.Base64Encode(encBK))); err != nil {
+	// Handshake complete
+	if err := protocol.SendFrame(conn, []byte("HANDSHAKE_OK")); err != nil {
 		conn.Close()
 		return
 	}
@@ -443,8 +479,8 @@ func (s *Server) removeClient(client *Client) {
 
 func (s *Server) SendSystemMessage(client *Client, content string) {
 	msg := protocol.CreateMessage(config.MsgTypeSystem, content, "SERVER")
-	msgJSON, _ := msg.ToJSON()
-	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
+	msgBytes, _ := msg.Encode()
+	enc, _ := crypto.Encrypt(client.EncryptionKey, msgBytes)
 
 	select {
 	case client.SendChan <- crypto.Base64Encode(enc):
@@ -453,9 +489,9 @@ func (s *Server) SendSystemMessage(client *Client, content string) {
 	}
 }
 
-func (s *Server) SendMessage(client *Client, msg protocol.ChatMessage) {
-	msgJSON, _ := msg.ToJSON()
-	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
+func (s *Server) SendMessage(client *Client, msg *protocol.ChatMessage) {
+	msgBytes, _ := msg.Encode()
+	enc, _ := crypto.Encrypt(client.EncryptionKey, msgBytes)
 
 	select {
 	case client.SendChan <- crypto.Base64Encode(enc):
@@ -476,7 +512,7 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return
 	}
 
-	msg, err := protocol.FromJSON(string(decryptedBytes))
+	msg, err := protocol.Decode(decryptedBytes)
 	if err != nil {
 		return
 	}
@@ -507,8 +543,9 @@ func (s *Server) processClientMessage(client *Client, text string) {
 			}
 			s.MediaDB.Store(id, entry)
 
-			info := fmt.Sprintf("[FILE] %s shared: %s (ID: %s) — /download %s", client.Nickname, filename, id, id)
-			bmsg := protocol.CreateMessage(config.MsgTypeMediaInfo, info, "SERVER")
+			info := fmt.Sprintf("[FILE] %s shared: %s (ID: %s)", client.Nickname, filename, id)
+			bmsg := protocol.CreateMessage(config.MsgTypeMediaInfo, info, client.Nickname)
+			bmsg.FileId = id
 			s.BroadcastToState(client.State, bmsg, "")
 			s.Log(fmt.Sprintf("[MEDIA] %s registered %s -> %s", client.Nickname, filename, id))
 			s.AddEvent("📎", fmt.Sprintf("%s shared: %s (ID: %s)", client.Nickname, filename, id))
@@ -517,24 +554,26 @@ func (s *Server) processClientMessage(client *Client, text string) {
 	}
 
 	if msg.Type == config.MsgTypeMediaData {
-		parts := strings.SplitN(msg.Content, "|", 3)
-		if len(parts) == 3 {
-			filename := parts[0]
-			data := parts[1]
-			targetNick := parts[2]
-
-			target := s.ClientManager.GetClientByNickname(targetNick)
-			if target != nil {
-				resp := protocol.CreateMessage(config.MsgTypeMediaData, filename+"|"+data, "SERVER")
-				msgJSON, _ := resp.ToJSON()
-				enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
-				select {
-				case target.SendChan <- crypto.Base64Encode(enc):
-					s.Log(fmt.Sprintf("[PUSH] Forwarded %s to %s", filename, targetNick))
-					s.AddEvent("⬇️", fmt.Sprintf("%s downloaded: %s", targetNick, filename))
-				default:
+		parts := strings.SplitN(msg.Content, "|", 2)
+		if len(parts) >= 2 {
+			// We can now handle broadcasts or targeted relay
+			// If target is provided in content for backwards compatibility,
+			// or we can use a new protocol field.
+			// For now, let's just relay as-is to either everyone or target.
+			
+			// If it's a targeted relay (last part of content if 3 parts)
+			targetedParts := strings.SplitN(msg.Content, "|", 3)
+			if len(targetedParts) == 3 {
+				targetNick := targetedParts[2]
+				target := s.ClientManager.GetClientByNickname(targetNick)
+				if target != nil {
+					s.SendMessage(target, msg)
+					return
 				}
 			}
+
+			// Broadcast to all
+			s.BroadcastToState("WHITELISTED", msg, client.Address)
 		}
 		return
 	}
@@ -550,8 +589,8 @@ func (s *Server) processClientMessage(client *Client, text string) {
 				// We send a system message or a special type to the owner
 				// For simplicity, let's reuse MsgTypeDownloadReq but with the file ID
 				req := protocol.CreateMessage(config.MsgTypeDownloadReq, entry.Filename+"|"+msg.Sender, "SERVER")
-				reqJSON, _ := req.ToJSON()
-				enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(reqJSON))
+				reqBytes, _ := req.Encode()
+				enc, _ := crypto.Encrypt(owner.EncryptionKey, reqBytes)
 				select {
 				case owner.SendChan <- crypto.Base64Encode(enc):
 					s.Log(fmt.Sprintf("[PULL] Requested %s from %s for %s", entry.Filename, owner.Nickname, client.Nickname))
@@ -563,6 +602,21 @@ func (s *Server) processClientMessage(client *Client, text string) {
 			}
 		} else {
 			s.SendSystemMessage(client, "File not found or expired.")
+		}
+		return
+	}
+
+	if (msg.Type == config.MsgTypePrivate || msg.Type == config.MsgTypeKeyShare) && msg.IsE2Ee {
+		parts := strings.SplitN(msg.Content, "|", 2)
+		if len(parts) == 2 {
+			targetNick := parts[0]
+			blob := parts[1]
+			target := s.ClientManager.GetClientByNickname(targetNick)
+			if target != nil {
+				relay := protocol.CreateMessage(msg.Type, blob, client.Nickname)
+				relay.IsE2Ee = true
+				s.SendMessage(target, relay)
+			}
 		}
 		return
 	}
@@ -602,13 +656,14 @@ func (s *Server) BroadcastAnnouncement(text string) {
 }
 
 func (s *Server) BroadcastUserList() {
-	var users []string
+	var userInfos []string
 	for _, c := range s.ClientManager.GetAllClients() {
 		if c.State == "WHITELISTED" {
-			users = append(users, c.Nickname)
+			// nick|e2e_pub_b64
+			userInfos = append(userInfos, c.Nickname+"|"+crypto.Base64Encode(c.E2EPubKey))
 		}
 	}
-	userList := strings.Join(users, ",")
+	userList := strings.Join(userInfos, ",")
 	msg := protocol.CreateMessage(config.MsgTypeUserList, userList, "SERVER")
 
 	// Broadcast to everyone so their sidebars update
@@ -616,11 +671,11 @@ func (s *Server) BroadcastUserList() {
 	clients := s.ClientManager.GetAllClients()
 	s.mu.RUnlock()
 
-	msgJSON, _ := msg.ToJSON()
-	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
-	payload := crypto.Base64Encode(enc)
+	msgBytes, _ := msg.Encode()
 
 	for _, c := range clients {
+		enc, _ := crypto.Encrypt(c.EncryptionKey, msgBytes)
+		payload := crypto.Base64Encode(enc)
 		select {
 		case c.SendChan <- payload:
 		default:
@@ -628,16 +683,16 @@ func (s *Server) BroadcastUserList() {
 	}
 }
 
-func (s *Server) BroadcastToState(state string, msg protocol.ChatMessage, excludeID string) {
-	msgJSON, _ := msg.ToJSON()
-	enc, _ := crypto.Encrypt(s.BroadcastKey, []byte(msgJSON))
-	b64 := crypto.Base64Encode(enc)
+func (s *Server) BroadcastToState(state string, msg *protocol.ChatMessage, excludeID string) {
+	msgBytes, _ := msg.Encode()
 
 	sentCount := 0
 	for _, c := range s.ClientManager.GetAllClients() {
 		if c.State == state && c.Address != excludeID {
+			enc, _ := crypto.Encrypt(c.EncryptionKey, msgBytes)
+			payload := crypto.Base64Encode(enc)
 			select {
-			case c.SendChan <- b64:
+			case c.SendChan <- payload:
 				sentCount++
 			default:
 				s.Log(fmt.Sprintf("Dropped message for %s (buffer full)", c.Nickname))

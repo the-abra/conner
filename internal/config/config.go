@@ -35,4 +35,7 @@ const (
 	MsgTypeMediaData = "MEDIA_DATA"
 	MsgTypeDownloadReq = "DOWNLOAD_REQ"
 	MsgTypeMediaRegister = "MEDIA_REGISTER"
+	MsgTypeTyping = "TYPING"
+	MsgTypeKeyShare = "KEY_SHARE"
+	MsgTypeFileOffer = "FILE_OFFER"
 )
