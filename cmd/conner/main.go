@@ -45,6 +45,19 @@ func main() {
 		fmt.Printf("[!] Auto-setup warning: %v\n", err)
 	}
 
+	// Auto-disable Tor for client if not connecting to .onion
+	if !*isServer && *useTor {
+		args := flag.Args()
+		address := "127.0.0.1:6666"
+		if len(args) >= 2 {
+			address = args[1]
+		}
+		if !strings.Contains(address, ".onion") {
+			fmt.Println("[*] Target address is not an onion address. Auto-disabling Tor.")
+			*useTor = false
+		}
+	}
+
 	if *useTor {
 		if err := startTor(*isServer); err != nil {
 			log.Fatalf("[!] Tor initialization failed: %v", err)

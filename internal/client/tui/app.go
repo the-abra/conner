@@ -8,12 +8,15 @@ import (
 
 	"conner/internal/client"
 	"conner/internal/config"
+	"conner/internal/crypto"
 	"conner/internal/protocol"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wrap"
 )
 
 // ─── Colour palette ──────────────────────────────────────────────────────────
@@ -86,47 +89,76 @@ var (
 // ─── Message types ────────────────────────────────────────────────────────────
 
 type incomingMsg *protocol.ChatMessage
-type uploadDoneMsg struct {
+type downloadDoneMsg struct {
 	err      error
-	filename string
-	b64data  string
+	destPath string
+}
+
+func doDownload(onion, fileID, token, destPath string) tea.Cmd {
+	return func() tea.Msg {
+		err := client.DownloadFile(onion, fileID, token, destPath)
+		return downloadDoneMsg{err: err, destPath: destPath}
+	}
 }
 
 // ─── Model ────────────────────────────────────────────────────────────────────
+
+type chatRow struct {
+	Rendered  string
+	MsgId     string
+	Acked     bool
+	IsOwn     bool
+	Reactions map[string][]string // Emoji -> Usernames
+}
 
 type model struct {
 	cli            *client.Client
 	nickname       string
 	width          int
 	height         int
-	input          textinput.Model
+	input          textarea.Model
 	viewport       viewport.Model
-	lines          []string // rendered lines in the viewport
+	rows           []chatRow // rendered chat rows
 	showHelp       bool
 	state          string // PENDING, WHITELISTED
 	onlineUsers    []string
 	isAdmin        bool
+	typingUsers    map[string]time.Time
+	lastTypingSent time.Time
+	p2p            *client.P2PService
+	autoDownload   bool
 }
 
 func InitialModel(c *client.Client, nick string) tea.Model {
 	m := &model{
-		cli:      c,
-		nickname: nick,
-		viewport: viewport.New(0, 0),
-		state:    "PENDING",
+		cli:         c,
+		nickname:    nick,
+		viewport:    viewport.New(0, 0),
+		state:       "PENDING",
+		typingUsers: make(map[string]time.Time),
 	}
 	if c == nil {
 		m.state = "BANNED"
+	} else {
+		// Initialize P2P silently
+		go func() {
+			if svc, err := client.StartP2PService(c.UseTor); err == nil {
+				m.p2p = svc
+			}
+		}()
 	}
 
-	ti := textinput.New()
-	ti.Placeholder = "Type a message... (/help for commands)"
-	ti.Focus()
-	ti.CharLimit = 4096
-	ti.Width = 80
-	m.input = ti
-	m.input.PromptStyle = lipgloss.NewStyle().Foreground(clrGreen)
-	m.input.TextStyle = lipgloss.NewStyle().Foreground(clrInput)
+	ta := textarea.New()
+	ta.Placeholder = "Type a message... (Shift+Enter for new line, /help for commands)"
+	ta.Focus()
+	ta.CharLimit = 4096
+	ta.SetWidth(80)
+	ta.SetHeight(3)
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.ShowLineNumbers = false
+	ta.KeyMap.InsertNewline.SetKeys("shift+enter", "ctrl+j", "alt+enter")
+	m.input = ta
+	// We do not need PromptStyle/TextStyle config the same way as textinput, textarea uses its own styles.
 	return m
 }
 
@@ -134,7 +166,7 @@ func (m model) Init() tea.Cmd {
 	if m.cli == nil {
 		return nil
 	}
-	return tea.Batch(textinput.Blink, m.waitForMsg())
+	return tea.Batch(textarea.Blink, m.waitForMsg())
 }
 
 func (m model) waitForMsg() tea.Cmd {
@@ -156,6 +188,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+
+	case downloadDoneMsg:
+		if msg.err != nil {
+			m.appendSystem(fmt.Sprintf("❌ Download failed: %v", msg.err))
+		} else {
+			m.appendSystem(fmt.Sprintf("✅ Download complete: %s", msg.destPath))
+		}
+		m.refreshViewport()
 
 	case incomingMsg:
 		if msg.Type == config.MsgTypeSystem {
@@ -184,8 +224,99 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.onlineUsers = append(m.onlineUsers, parts[0])
 				}
 			}
-		}
-		if msg.Type != config.MsgTypeUserList {
+		} else if msg.Type == config.MsgTypeReaction {
+			parts := strings.SplitN(msg.Content, "|", 2)
+			if len(parts) == 2 {
+				targetID := parts[0]
+				emoji := parts[1]
+				for i := len(m.rows) - 1; i >= 0; i-- {
+					if m.rows[i].MsgId == targetID {
+						if m.rows[i].Reactions == nil {
+							m.rows[i].Reactions = make(map[string][]string)
+						}
+						// Prevent duplicate reactions from the same user for the same emoji
+						exists := false
+						for _, u := range m.rows[i].Reactions[emoji] {
+							if u == msg.Sender {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							m.rows[i].Reactions[emoji] = append(m.rows[i].Reactions[emoji], msg.Sender)
+							m.refreshViewport()
+						}
+						break
+					}
+				}
+			}
+		} else if msg.Type == config.MsgTypeAck {
+			for i := len(m.rows) - 1; i >= 0; i-- {
+				if m.rows[i].MsgId == msg.Content {
+					m.rows[i].Acked = true
+					m.refreshViewport()
+					break
+				}
+			}
+		} else if msg.Type == config.MsgTypeShare {
+			if m.autoDownload && msg.Sender != m.nickname {
+				m.appendSystem(fmt.Sprintf("⏳ Auto-downloading new file from %s...", msg.Sender))
+				m.refreshViewport()
+				getMeta := protocol.CreateMessage(config.MsgTypeGetFileMetadata, msg.FileId, m.nickname)
+				m.cli.SendChan <- getMeta
+			}
+		} else if msg.Type == config.MsgTypeGetFileMetadata {
+			m.appendSystem(fmt.Sprintf("✅ Metadata received for: %s", msg.FileId))
+			
+			// Extract just the base filename if it was a path
+			baseName := msg.Content
+			if strings.Contains(baseName, "/") {
+				parts := strings.Split(baseName, "/")
+				baseName = parts[len(parts)-1]
+			} else if strings.Contains(baseName, "\\") {
+				parts := strings.Split(baseName, "\\")
+				baseName = parts[len(parts)-1]
+			}
+			
+			destDir := "."
+			if m.autoDownload {
+				destDir = "downloads"
+			}
+			destPath := fmt.Sprintf("%s/downloaded_%s_%s", destDir, msg.FileId, baseName)
+			
+			m.appendSystem(fmt.Sprintf("⏳ Downloading to %s...", destPath))
+			m.refreshViewport()
+
+			if msg.OnionAddr == "SERVER" {
+				req := protocol.CreateMessage(config.MsgTypeFileDownloadReq, destPath, m.nickname)
+				req.FileId = msg.FileId
+				m.cli.SendChan <- req
+			} else {
+				cmds = append(cmds, doDownload(msg.OnionAddr, msg.FileId, msg.FileToken, destPath))
+			}
+		} else if msg.Type == config.MsgTypeFileDownloadRes {
+			destPath := msg.ReplyTo
+			data, _ := crypto.Base64Decode(msg.Content)
+			flags := os.O_CREATE | os.O_WRONLY
+			if msg.ChunkIdx > 0 {
+				flags |= os.O_APPEND
+			} else {
+				flags |= os.O_TRUNC
+			}
+			f, err := os.OpenFile(destPath, flags, 0644)
+			if err == nil {
+				f.Write(data)
+				f.Close()
+			}
+			if msg.ChunkIdx == msg.TotalChunks-1 {
+				m.appendSystem(fmt.Sprintf("✅ Server Download complete: %s", destPath))
+				m.refreshViewport()
+			}
+		} else if msg.Type == config.MsgTypeTyping {
+			if msg.Sender != m.nickname {
+				m.typingUsers[msg.Sender] = time.Now()
+			}
+		} else {
 			rendered := m.renderMessage(msg)
 			if rendered != "" {
 				m.appendLine(rendered)
@@ -259,7 +390,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if val == "" {
 				break
 			}
-			m.input.SetValue("")
+			m.input.Reset()
 			cmds = append(cmds, m.handleInput(val))
 
 		case "up", "down", "pgup", "pgdown":
@@ -268,15 +399,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.input.Width = msg.Width - 6
+		m.input.SetWidth(msg.Width - 6)
 		m.viewport.Width = msg.Width - 2
-		m.viewport.Height = msg.Height - 6
+		m.viewport.Height = msg.Height - 8 // adjust height to leave room for textarea
 		m.refreshViewport()
 	}
 
 	if !m.showHelp {
 		m.input, cmd = m.input.Update(msg)
 		cmds = append(cmds, cmd)
+		
+		if _, ok := msg.(tea.KeyMsg); ok && m.state == "" {
+			val := m.input.Value()
+			if len(val) > 0 && !strings.HasPrefix(val, "/") {
+				if time.Since(m.lastTypingSent) > 2*time.Second {
+					typingMsg := protocol.CreateMessage(config.MsgTypeTyping, "", m.nickname)
+					select {
+					case m.cli.SendChan <- typingMsg:
+						m.lastTypingSent = time.Now()
+					default:
+					}
+				}
+			}
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -298,6 +443,164 @@ func (m *model) handleInput(val string) tea.Cmd {
 			os.Remove("identity.key")
 			os.Exit(0)
 		}()
+		return nil
+
+	case strings.HasPrefix(val, "/react "):
+		parts := strings.SplitN(val, " ", 2)
+		if len(parts) == 2 {
+			emoji := parts[1]
+			// Find the last message that is not ours
+			var targetID string
+			for i := len(m.rows) - 1; i >= 0; i-- {
+				if m.rows[i].MsgId != "" && !m.rows[i].IsOwn {
+					targetID = m.rows[i].MsgId
+					break
+				}
+			}
+			if targetID != "" {
+				reactionMsg := protocol.CreateMessage(config.MsgTypeReaction, targetID+"|"+emoji, m.nickname)
+				m.cli.SendChan <- reactionMsg
+				
+				// Echo locally
+				for i := len(m.rows) - 1; i >= 0; i-- {
+					if m.rows[i].MsgId == targetID {
+						if m.rows[i].Reactions == nil {
+							m.rows[i].Reactions = make(map[string][]string)
+						}
+						m.rows[i].Reactions[emoji] = append(m.rows[i].Reactions[emoji], m.nickname)
+						m.refreshViewport()
+						break
+					}
+				}
+			} else {
+				m.appendSystem("❌ No recent message found to react to.")
+				m.refreshViewport()
+			}
+		}
+		return nil
+
+	case strings.HasPrefix(val, "/share "):
+		parts := strings.SplitN(val, " ", 2)
+		if len(parts) < 2 {
+			m.appendSystem("Usage: /share <filepath>")
+			m.refreshViewport()
+			return nil
+		}
+		path := parts[1]
+
+		if m.cli.UseTor {
+			if m.p2p == nil {
+				m.appendSystem("❌ P2P service not initialized yet. Wait a moment or check Tor.")
+				m.refreshViewport()
+				return nil
+			}
+			fileID, err := m.p2p.ShareFile(path)
+			if err != nil {
+				m.appendSystem(fmt.Sprintf("❌ Error sharing file: %v", err))
+				m.refreshViewport()
+				return nil
+			}
+
+			// 1. Send metadata to server
+			shareMeta := protocol.CreateMessage(config.MsgTypeShare, path, m.nickname)
+			shareMeta.FileId = fileID
+			shareMeta.OnionAddr = m.p2p.OnionAddr
+			shareMeta.FileToken = m.p2p.Token
+			m.cli.SendChan <- shareMeta
+
+			// 2. Broadcast simple chat announcement
+			linkMsg := fmt.Sprintf("🔗 Ephemeral Tor Share: %s\nType: /download %s", path, fileID)
+			chatMsg := protocol.CreateMessage(config.MsgTypeChat, linkMsg, m.nickname)
+			m.cli.SendChan <- chatMsg
+
+			m.appendRow(chatRow{
+				Rendered: m.renderSelf(linkMsg),
+				MsgId:    chatMsg.MessageId,
+				IsOwn:    true,
+				Acked:    false,
+			})
+		} else {
+			// Non-Tor: Upload to server
+			data, err := os.ReadFile(path)
+			if err != nil {
+				m.appendSystem(fmt.Sprintf("❌ Error reading file: %v", err))
+				m.refreshViewport()
+				return nil
+			}
+			
+			// Simple hex token for fileID
+			fileID := fmt.Sprintf("%d", time.Now().UnixNano())[:8] // simple ID
+
+			m.appendSystem(fmt.Sprintf("⏳ Uploading %s to server...", path))
+			
+			go func() {
+				chunkSize := 512 * 1024
+				totalChunks := (len(data) + chunkSize - 1) / chunkSize
+				if len(data) == 0 {
+					totalChunks = 1
+				}
+				for i := 0; i < totalChunks; i++ {
+					start := i * chunkSize
+					end := start + chunkSize
+					if end > len(data) {
+						end = len(data)
+					}
+					
+					uploadMsg := protocol.CreateMessage(config.MsgTypeFileUpload, crypto.Base64Encode(data[start:end]), m.nickname)
+					uploadMsg.FileId = fileID
+					uploadMsg.ChunkIdx = int32(i)
+					uploadMsg.TotalChunks = int32(totalChunks)
+					
+					m.cli.SendChan <- uploadMsg
+				}
+				
+				// Once uploaded, send MsgTypeShare
+				shareMeta := protocol.CreateMessage(config.MsgTypeShare, path, m.nickname)
+				shareMeta.FileId = fileID
+				shareMeta.OnionAddr = "SERVER"
+				shareMeta.FileToken = "SERVER"
+				m.cli.SendChan <- shareMeta
+				
+				// Local announcement
+				linkMsg := fmt.Sprintf("🔗 Server Hosted Share: %s\nType: /download %s", path, fileID)
+				chatMsg := protocol.CreateMessage(config.MsgTypeChat, linkMsg, m.nickname)
+				m.cli.SendChan <- chatMsg
+				
+				// Notify user
+				m.cli.UpdateChan <- protocol.CreateMessage(config.MsgTypeSystem, fmt.Sprintf("✅ Uploaded %s to server.", path), "SERVER")
+			}()
+		}
+		
+		m.refreshViewport()
+		return nil
+
+	case strings.HasPrefix(val, "/download "):
+		parts := strings.Split(val, " ")
+		if len(parts) != 2 {
+			m.appendSystem("Usage: /download <id> or /download auto")
+			m.refreshViewport()
+			return nil
+		}
+		id := parts[1]
+		
+		if id == "auto" {
+			m.autoDownload = !m.autoDownload
+			if m.autoDownload {
+				os.MkdirAll("downloads", 0755)
+				m.appendSystem("✅ Auto-download ENABLED. Files will be saved to downloads/ directory.")
+			} else {
+				m.appendSystem("❌ Auto-download DISABLED.")
+			}
+			m.refreshViewport()
+			return nil
+		}
+
+		m.appendSystem(fmt.Sprintf("⏳ Requesting metadata for ID: %s...", id))
+		m.refreshViewport()
+
+		// Request metadata from server
+		getMeta := protocol.CreateMessage(config.MsgTypeGetFileMetadata, id, m.nickname)
+		m.cli.SendChan <- getMeta
 		return nil
 
 	case strings.HasPrefix(val, "/private"):
@@ -333,31 +636,85 @@ func (m *model) handleInput(val string) tea.Cmd {
 		chatMsg := protocol.CreateMessage(config.MsgTypeChat, val, m.nickname)
 		m.cli.SendChan <- chatMsg
 		// Echo own message locally
-		m.appendLine(m.renderSelf(val))
+		m.appendRow(chatRow{
+			Rendered: m.renderSelf(val),
+			MsgId:    chatMsg.MessageId,
+			IsOwn:    true,
+			Acked:    false,
+		})
 		m.refreshViewport()
 	}
 	return nil
 }
 
-func (m *model) appendLine(line string) {
-	m.lines = append(m.lines, line)
+func (m *model) appendRow(row chatRow) {
+	m.rows = append(m.rows, row)
 	// Limit history to 1000 lines to prevent memory bloat
-	if len(m.lines) > 1000 {
-		m.lines = m.lines[len(m.lines)-1000:]
+	if len(m.rows) > 1000 {
+		m.rows = m.rows[len(m.rows)-1000:]
 	}
 }
 
+func (m *model) appendLine(line string) {
+	m.appendRow(chatRow{Rendered: line})
+}
+
 func (m *model) appendSystem(text string) {
-	m.appendLine(styleSystem.Render("  · " + text))
+	m.appendRow(chatRow{Rendered: styleSystem.Render("  · " + text)})
 }
 
 func (m *model) refreshViewport() {
-	content := lipgloss.NewStyle().Width(m.width - 2).Render(strings.Join(m.lines, "\n"))
+	var lines []string
+	for _, row := range m.rows {
+		text := row.Rendered
+		if row.IsOwn {
+			if row.Acked {
+				text += " " + lipgloss.NewStyle().Foreground(clrDim).Render("✓✓")
+			} else {
+				text += " " + lipgloss.NewStyle().Foreground(clrDim).Render("✓")
+			}
+		}
+		
+		if len(row.Reactions) > 0 {
+			var reactionStrs []string
+			for emoji, users := range row.Reactions {
+				reactionStrs = append(reactionStrs, fmt.Sprintf("%s %d", emoji, len(users)))
+			}
+			text += "\n    " + lipgloss.NewStyle().Foreground(clrDim).Render("[ "+strings.Join(reactionStrs, "  ")+" ]")
+		}
+		
+		lines = append(lines, text)
+	}
+	rawContent := strings.Join(lines, "\n")
+	w := m.width - 2
+	if w < 10 {
+		w = 10
+	}
+	wrappedContent := wrap.String(rawContent, w)
+	content := lipgloss.NewStyle().Width(w).Render(wrappedContent)
 	m.viewport.SetContent(content)
 	m.viewport.GotoBottom()
 }
 
 // ─── Render helpers ───────────────────────────────────────────────────────────
+
+func (m model) renderMarkdown(text string) string {
+	w := m.width - 25
+	if w < 40 {
+		w = 40
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStandardStyle("dark"),
+		glamour.WithWordWrap(w),
+	)
+	if err == nil {
+		out, err := r.Render(text)
+		if err == nil {
+			return strings.TrimSpace(out)
+		}
+	}
+	return text
+}
 
 // renderMessage converts a ChatMessage into a styled terminal line.
 // Rules:
@@ -403,15 +760,15 @@ func (m model) renderMessage(msg *protocol.ChatMessage) string {
 			sb.WriteString(styleOther.Render(msg.Sender))
 		}
 
-		sb.WriteString(styleDim.Render(": "))
-		sb.WriteString(styleBody.Render(msg.Content))
+		sb.WriteString(styleDim.Render(":\n"))
+		sb.WriteString(m.renderMarkdown(msg.Content))
 		return "  " + sb.String()
 	}
 }
 
 // renderSelf is used for the local echo of the user's own typed message.
 func (m model) renderSelf(content string) string {
-	return "  " + styleSelf.Render(m.nickname) + styleDim.Render(": ") + styleBody.Render(content)
+	return "  " + styleSelf.Render(m.nickname) + styleDim.Render(":\n") + m.renderMarkdown(content)
 }
 
 // ─── View ─────────────────────────────────────────────────────────────────────
@@ -590,6 +947,26 @@ func (m model) View() string {
 	}
 
 	sb.WriteString("\n")
+
+	var typing []string
+	now := time.Now()
+	for user, t := range m.typingUsers {
+		if now.Sub(t) < 3*time.Second {
+			typing = append(typing, user)
+		} else {
+			delete(m.typingUsers, user)
+		}
+	}
+	
+	if len(typing) > 0 {
+		typingText := strings.Join(typing, ", ")
+		if len(typing) == 1 {
+			typingText += " is typing..."
+		} else {
+			typingText += " are typing..."
+		}
+		sb.WriteString(styleDim.Render("  " + typingText) + "\n")
+	}
 
 	// Input box
 	sb.WriteString(styleInputBox.Width(m.width - 4).Render(m.input.View()))

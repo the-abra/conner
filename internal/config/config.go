@@ -39,6 +39,13 @@ const (
 	MsgTypeTyping = "TYPING"
 	MsgTypeKeyShare = "KEY_SHARE"
 	MsgTypeRoomKey = "ROOM_KEY"
+	MsgTypeAck     = "ACK"
+	MsgTypeReaction = "REACTION"
+	MsgTypeShare    = "SHARE"
+	MsgTypeGetFileMetadata = "GET_FILE_METADATA"
+	MsgTypeFileUpload = "FILE_UPLOAD"
+	MsgTypeFileDownloadReq = "FILE_DOWNLOAD_REQ"
+	MsgTypeFileDownloadRes = "FILE_DOWNLOAD_RES"
 )
 
 // Tor Config

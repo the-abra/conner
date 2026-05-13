@@ -38,6 +38,8 @@ type ChatMessage struct {
 	TotalChunks   int32                  `protobuf:"varint,13,opt,name=total_chunks,json=totalChunks,proto3" json:"total_chunks,omitempty"`
 	OnionAddr     string                 `protobuf:"bytes,14,opt,name=onion_addr,json=onionAddr,proto3" json:"onion_addr,omitempty"`
 	RatchetStep   uint32                 `protobuf:"varint,15,opt,name=ratchet_step,json=ratchetStep,proto3" json:"ratchet_step,omitempty"`
+	MessageId     string                 `protobuf:"bytes,16,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"`
+	FileToken     string                 `protobuf:"bytes,17,opt,name=file_token,json=fileToken,proto3" json:"file_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -177,11 +179,25 @@ func (x *ChatMessage) GetRatchetStep() uint32 {
 	return 0
 }
 
+func (x *ChatMessage) GetMessageId() string {
+	if x != nil {
+		return x.MessageId
+	}
+	return ""
+}
+
+func (x *ChatMessage) GetFileToken() string {
+	if x != nil {
+		return x.FileToken
+	}
+	return ""
+}
+
 var File_internal_protocol_conner_proto protoreflect.FileDescriptor
 
 const file_internal_protocol_conner_proto_rawDesc = "" +
 	"\n" +
-	"\x1einternal/protocol/conner.proto\x12\bprotocol\"\xae\x03\n" +
+	"\x1einternal/protocol/conner.proto\x12\bprotocol\"\xec\x03\n" +
 	"\vChatMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\tR\acontent\x12\x16\n" +
@@ -199,7 +215,11 @@ const file_internal_protocol_conner_proto_rawDesc = "" +
 	"\ftotal_chunks\x18\r \x01(\x05R\vtotalChunks\x12\x1d\n" +
 	"\n" +
 	"onion_addr\x18\x0e \x01(\tR\tonionAddr\x12!\n" +
-	"\fratchet_step\x18\x0f \x01(\rR\vratchetStepB\x1aZ\x18conner/internal/protocolb\x06proto3"
+	"\fratchet_step\x18\x0f \x01(\rR\vratchetStep\x12\x1d\n" +
+	"\n" +
+	"message_id\x18\x10 \x01(\tR\tmessageId\x12\x1d\n" +
+	"\n" +
+	"file_token\x18\x11 \x01(\tR\tfileTokenB\x1aZ\x18conner/internal/protocolb\x06proto3"
 
 var (
 	file_internal_protocol_conner_proto_rawDescOnce sync.Once

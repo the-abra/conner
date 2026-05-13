@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"conner/internal/config"
@@ -24,6 +25,8 @@ type P2PService struct {
 	Token     string
 	Port      int
 	Listener  net.Listener
+	files     map[string]string // map[file_id]filepath
+	mu        sync.Mutex
 }
 
 func GenerateToken() string {
@@ -32,49 +35,90 @@ func GenerateToken() string {
 	return hex.EncodeToString(b)
 }
 
-// StartP2PService initializes a single onion service for the entire session
-func StartP2PService(uploadDir string) (*P2PService, error) {
+func GetOutboundIP() net.IP {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return net.ParseIP("127.0.0.1")
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP
+}
+
+// StartP2PService initializes a single onion service (or direct service) for the entire session
+func StartP2PService(useTor bool) (*P2PService, error) {
+	if useTor && !isTorRunning() {
+		return nil, fmt.Errorf("tor is not running")
+	}
+
 	token := GenerateToken()
+	svc := &P2PService{
+		Token: token,
+		files: make(map[string]string),
+	}
 	
-	// 1. Start local server serving the upload directory
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	// 1. Start local server
+	listenAddr := "127.0.0.1:0"
+	if !useTor {
+		listenAddr = "0.0.0.0:0"
+	}
+	
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
+	svc.Port = listener.Addr().(*net.TCPAddr).Port
+	svc.Listener = listener
 
 	mux := http.NewServeMux()
-	fileServer := http.FileServer(http.Dir(uploadDir))
 	
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		// Simple Token Auth
-		if r.URL.Query().Get("t") != token {
+		if r.URL.Query().Get("t") != svc.Token {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		// Security: Prevent directory listing or path traversal
-		if r.URL.Path == "/" || strings.Contains(r.URL.Path, "..") {
-			http.Error(w, "Forbidden", http.StatusForbidden)
+		
+		fileID := r.URL.Query().Get("f")
+		svc.mu.Lock()
+		filePath, exists := svc.files[fileID]
+		svc.mu.Unlock()
+
+		if !exists {
+			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
-		fileServer.ServeHTTP(w, r)
+
+		http.ServeFile(w, r, filePath)
 	})
 
 	go http.Serve(listener, mux)
 
-	// 2. Register with Tor
-	onion, err := createOnion(port)
-	if err != nil {
-		listener.Close()
-		return nil, err
+	// 2. Register with Tor OR use public IP
+	if useTor {
+		onion, err := createOnion(svc.Port)
+		if err != nil {
+			listener.Close()
+			return nil, err
+		}
+		svc.OnionAddr = onion
+	} else {
+		outboundIP := GetOutboundIP()
+		svc.OnionAddr = fmt.Sprintf("%s:%d", outboundIP.String(), svc.Port)
 	}
 
-	return &P2PService{
-		OnionAddr: onion,
-		Token:     token,
-		Port:      port,
-		Listener:  listener,
-	}, nil
+	return svc, nil
+}
+
+func (s *P2PService) ShareFile(filePath string) (string, error) {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return "", err
+	}
+	fileID := GenerateToken()[:8] // Short ID
+	s.mu.Lock()
+	s.files[fileID] = filePath
+	s.mu.Unlock()
+	return fileID, nil
 }
 
 func createOnion(localPort int) (string, error) {
@@ -108,19 +152,24 @@ func createOnion(localPort int) (string, error) {
 	return serviceID + ".onion", nil
 }
 
-func DownloadFile(onionAddr, fileName, token, destPath string) error {
-	_ = ensureTorRunning()
+func DownloadFile(address, fileName, token, destPath string) error {
+	var client *http.Client
 
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialer, _ := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
-			return dialer.Dial(network, addr)
-		},
+	if strings.HasSuffix(address, ".onion") {
+		_ = ensureTorRunning()
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialer, _ := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
+				return dialer.Dial(network, addr)
+			},
+		}
+		client = &http.Client{Transport: transport, Timeout: 1 * time.Hour}
+	} else {
+		client = &http.Client{Timeout: 1 * time.Hour}
 	}
-	client := &http.Client{Transport: transport, Timeout: 1 * time.Hour}
 
-	// URL format: http://onion/download?f=filename&t=token
-	url := fmt.Sprintf("http://%s/download?f=%s&t=%s", onionAddr, url.QueryEscape(fileName), token)
+	// URL format: http://address/download?f=filename&t=token
+	url := fmt.Sprintf("http://%s/download?f=%s&t=%s", address, url.QueryEscape(fileName), token)
 	resp, err := client.Get(url)
 	if err != nil {
 		return err

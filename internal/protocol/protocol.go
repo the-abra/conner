@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"time"
@@ -8,12 +10,19 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func generateID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func CreateMessage(msgType, content, sender string) *ChatMessage {
 	return &ChatMessage{
 		Type:      msgType,
 		Content:   content,
 		Sender:    sender,
 		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+		MessageId: generateID(),
 	}
 }
 

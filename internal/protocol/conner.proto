@@ -20,4 +20,6 @@ message ChatMessage {
     int32 total_chunks = 13;
     string onion_addr = 14;
     uint32 ratchet_step = 15;
+    string message_id = 16;
+    string file_token = 17;
 }

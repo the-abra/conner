@@ -37,6 +37,7 @@ type Server struct {
 	WhitelistMap   map[string]string // SigningPubKey (B64) -> Identity
 	CmdRegistry    *CommandRegistry
 	RoomKey       []byte // Central AES key (Ephemeral, wiped)
+	FileMetadata  map[string]*protocol.ChatMessage
 }
 
 type ServerStats struct {
@@ -131,6 +132,7 @@ func NewServer() *Server {
 		CmdRegistry:    NewCommandRegistry(),
 		BlacklistMap:   make(map[string]string),
 		WhitelistMap:   make(map[string]string),
+		FileMetadata:   make(map[string]*protocol.ChatMessage),
 	}
 }
 
@@ -501,6 +503,118 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return // Heartbeat - just keeping connection alive
 	}
 
+	if msg.Type == config.MsgTypeTyping {
+		broadcastMsg := protocol.CreateMessage(config.MsgTypeTyping, "", client.Nickname)
+		s.BroadcastToState(client.State, broadcastMsg, client.Address)
+		return
+	}
+
+	if msg.Type == config.MsgTypeReaction {
+		broadcastMsg := protocol.CreateMessage(config.MsgTypeReaction, msg.Content, client.Nickname)
+		s.BroadcastToState(client.State, broadcastMsg, client.Address)
+		return
+	}
+
+	if msg.Type == config.MsgTypeShare {
+		s.mu.Lock()
+		s.FileMetadata[msg.FileId] = msg
+		s.mu.Unlock()
+		s.Log(fmt.Sprintf("[SHARE] %s shared file: %s (ID: %s)", client.Nickname, msg.Content, msg.FileId))
+		
+		broadcastMsg := protocol.CreateMessage(config.MsgTypeShare, msg.Content, client.Nickname)
+		broadcastMsg.FileId = msg.FileId
+		s.BroadcastToState(client.State, broadcastMsg, client.Address)
+		return
+	}
+
+	if msg.Type == config.MsgTypeFileUpload {
+		os.MkdirAll("server_uploads", 0755)
+		path := filepath.Join("server_uploads", msg.FileId)
+		data, _ := crypto.Base64Decode(msg.Content)
+		
+		flags := os.O_CREATE | os.O_WRONLY
+		if msg.ChunkIdx > 0 {
+			flags |= os.O_APPEND
+		} else {
+			flags |= os.O_TRUNC
+		}
+		f, err := os.OpenFile(path, flags, 0644)
+		if err == nil {
+			f.Write(data)
+			f.Close()
+		}
+		
+		if msg.ChunkIdx == msg.TotalChunks-1 {
+			s.Log(fmt.Sprintf("[UPLOAD] %s finished uploading %s", client.Nickname, msg.FileId))
+		}
+		return
+	}
+
+	if msg.Type == config.MsgTypeFileDownloadReq {
+		path := filepath.Join("server_uploads", msg.FileId)
+		data, err := os.ReadFile(path)
+		if err == nil {
+			chunkSize := 512 * 1024
+			totalChunks := (len(data) + chunkSize - 1) / chunkSize
+			if len(data) == 0 {
+				totalChunks = 1
+			}
+			for i := 0; i < totalChunks; i++ {
+				start := i * chunkSize
+				end := start + chunkSize
+				if end > len(data) {
+					end = len(data)
+				}
+				
+				res := protocol.CreateMessage(config.MsgTypeFileDownloadRes, crypto.Base64Encode(data[start:end]), "SERVER")
+				res.FileId = msg.FileId
+				res.ReplyTo = msg.Content // Use ReplyTo for destPath
+				res.ChunkIdx = int32(i)
+				res.TotalChunks = int32(totalChunks)
+				
+				msgBytes, _ := res.Encode()
+				enc, _ := crypto.Encrypt(client.EncryptionKey, msgBytes)
+				client.SendChan <- crypto.Base64Encode(enc)
+			}
+		} else {
+			s.SendSystemMessage(client, "❌ Server could not find file: "+msg.FileId)
+		}
+		return
+	}
+
+	if msg.Type == config.MsgTypeGetFileMetadata {
+		s.mu.RLock()
+		meta, exists := s.FileMetadata[msg.Content]
+		s.mu.RUnlock()
+		if exists {
+			resp := protocol.CreateMessage(config.MsgTypeGetFileMetadata, meta.Content, "SERVER")
+			resp.FileId = meta.FileId
+			resp.OnionAddr = meta.OnionAddr
+			resp.FileToken = meta.FileToken
+			resp.ReplyTo = msg.Content // ID requested
+			
+			respBytes, _ := resp.Encode()
+			enc, _ := crypto.Encrypt(client.EncryptionKey, respBytes)
+			select {
+			case client.SendChan <- crypto.Base64Encode(enc):
+			default:
+			}
+		} else {
+			s.SendSystemMessage(client, "❌ File ID not found: "+msg.Content)
+		}
+		return
+	}
+
+	// Send ACK to sender for tracked message types
+	if (msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypePrivate) && msg.MessageId != "" {
+		ackMsg := protocol.CreateMessage(config.MsgTypeAck, msg.MessageId, "SERVER")
+		ackBytes, _ := ackMsg.Encode()
+		encAck, _ := crypto.Encrypt(client.EncryptionKey, ackBytes)
+		select {
+		case client.SendChan <- crypto.Base64Encode(encAck):
+		default:
+		}
+	}
 
 	// Handle Admin Commands
 	if msg.Type == config.MsgTypeChat && strings.HasPrefix(msg.Content, "/") {
@@ -534,6 +648,7 @@ func (s *Server) processClientMessage(client *Client, text string) {
 	}
 
 	broadcastMsg := protocol.CreateMessage(config.MsgTypeChat, msg.Content, client.Nickname)
+	broadcastMsg.MessageId = msg.MessageId
 	broadcastMsg.IsAdmin = client.IsAdmin
 	s.BroadcastToState(client.State, broadcastMsg, client.Address)
 }

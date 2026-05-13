@@ -67,6 +67,7 @@ type Client struct {
 	RoomKey            []byte      // Centralized AES key (Content)
 	VaultToken         string      // Server access token (Auth)
 	ServerOnion        string      // Onion address of the hub
+	UseTor             bool
 }
 
 
@@ -209,6 +210,7 @@ func Connect(nickname, address string, useTor bool) (*Client, error) {
 		UserKeys:           make(map[string][]byte),
 		IdentityStore:      NewIdentityStore(fmt.Sprintf("identities_%s.json", nickname)),
 		ServerOnion:        strings.Split(address, ":")[0],
+		UseTor:             useTor,
 	}
 
 	go client.readPump()
