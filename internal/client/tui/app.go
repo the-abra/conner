@@ -237,9 +237,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fp, cmd = m.fp.Update(msg)
 			if didSelect, path := m.fp.DidSelectFile(msg); didSelect {
 				m.showFilePicker = false
-				m.appendSystem("⏳ Creating Tor Ephemeral Service for " + path + "...")
+				m.appendSystem("⏳ Uploading " + path + " to server vault...")
 				go func() {
-					err := m.cli.SendFile(path)
+					err := m.cli.UploadToServer(path)
 					if err != nil {
 						msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Share failed: "+err.Error(), "SYSTEM")
 						m.cli.UpdateChan <- msg
@@ -359,11 +359,11 @@ func (m *model) handleInput(val string) tea.Cmd {
 		if len(parts) == 2 {
 			// Direct send
 			path := parts[1]
-			m.appendSystem("⏳ Creating Tor Ephemeral Service for " + path + "...")
+			m.appendSystem("⏳ Uploading " + path + " to server vault...")
 			go func() {
-				err := m.cli.SendFile(path)
+				err := m.cli.UploadToServer(path)
 				if err != nil {
-					msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Send failed: "+err.Error(), "SYSTEM")
+					msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Upload failed: "+err.Error(), "SYSTEM")
 					m.cli.UpdateChan <- msg
 				}
 			}()

@@ -119,8 +119,8 @@ func DownloadFile(onionAddr, fileName, token, destPath string) error {
 	}
 	client := &http.Client{Transport: transport, Timeout: 1 * time.Hour}
 
-	// URL format: http://onion/filename?t=token
-	url := fmt.Sprintf("http://%s/%s?t=%s", onionAddr, url.PathEscape(fileName), token)
+	// URL format: http://onion/download?f=filename&t=token
+	url := fmt.Sprintf("http://%s/download?f=%s&t=%s", onionAddr, url.QueryEscape(fileName), token)
 	resp, err := client.Get(url)
 	if err != nil {
 		return err

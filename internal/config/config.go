@@ -41,6 +41,7 @@ const (
 	MsgTypeTyping = "TYPING"
 	MsgTypeKeyShare = "KEY_SHARE"
 	MsgTypeFileOffer = "FILE_OFFER"
+	MsgTypeRoomKey = "ROOM_KEY"
 )
 
 // Tor Config

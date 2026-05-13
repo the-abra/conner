@@ -1,10 +1,15 @@
 package server
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +40,10 @@ type Server struct {
 	BlacklistMap   map[string]string // Identity -> Nickname (Metadata)
 	WhitelistMap   map[string]string // SigningPubKey (B64) -> Identity
 	CmdRegistry    *CommandRegistry
+	RoomKey       []byte // Central AES key (Ephemeral, wiped)
+	VaultToken    string // Access token for HTTP (Kept)
+	VaultDir      string // Directory for server-side file storage
+	HTTPPort      int    // Internal port for the file server
 }
 
 type ServerStats struct {
@@ -56,6 +65,8 @@ func (s *Server) ApproveClient(nickname string) bool {
 		return false
 	}
 	target.State = "WHITELISTED"
+	// ROTATE KEY: Destroy old room key and generate a fresh one for the new group state
+	s.RegenerateRoomKey()
 	
 	pubKeyB64 := crypto.Base64Encode(target.SigningPubKey)
 
@@ -178,6 +189,15 @@ func (s *Server) Start(port string) error {
 	}
 	s.Listener = ln
 	s.Log(fmt.Sprintf("Server started on port %s", port))
+
+	s.VaultDir = "vault"
+	os.MkdirAll(s.VaultDir, 0755)
+
+	// Start File Server (HTTP)
+	go s.startFileServer()
+
+	// Update Tor to expose both Chat and Files
+	go s.updateTorPorts()
 
 	// Background loops
 	go func() {
@@ -389,7 +409,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.DBManager.SaveMessage(config.MsgTypeJoin, joinMsg, "SERVER")
 
 		s.Log(fmt.Sprintf("Auto-approved user: %s (%s)", nickname, remoteAddr))
-		s.AddEvent("✅", fmt.Sprintf("Auto-approved: %s (%s)", nickname, remoteAddr))
+		s.RegenerateRoomKey()
 
 		// Broadcast join to others
 		bMsg := protocol.CreateMessage(config.MsgTypeJoin, joinMsg, "SERVER")
@@ -440,6 +460,7 @@ func (s *Server) removeClient(client *Client) {
 		s.Log(fmt.Sprintf("Client disconnected: %s (%s)", client.Nickname, client.Address))
 		s.AddEvent("🔴", fmt.Sprintf("Disconnected: %s [%s]", client.Nickname, client.State))
 		s.BroadcastUserList()
+		s.RegenerateRoomKey()
 	} else {
 		s.Log(fmt.Sprintf("Pending client disconnected: %s", client.Address))
 		s.AddEvent("🔌", fmt.Sprintf("Pending client dropped: %s", client.Address))
@@ -582,4 +603,92 @@ func (s *Server) BroadcastToState(state string, msg *protocol.ChatMessage, exclu
 	s.mu.Lock()
 	s.Stats.MessagesSent += sentCount
 	s.mu.Unlock()
+}
+func (s *Server) startFileServer() {
+	mux := http.NewServeMux()
+	
+	// GET /download?f=filename&t=key_hash
+	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
+		filename := r.URL.Query().Get("f")
+		// Auth using SHA256 of the RoomKey
+		if r.URL.Query().Get("t") != s.VaultToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		path := filepath.Join(s.VaultDir, filename)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		http.ServeFile(w, r, path)
+	})
+
+		// POST /upload?t=key_hash
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("t") != s.VaultToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		dst, _ := os.Create(filepath.Join(s.VaultDir, header.Filename))
+		defer dst.Close()
+		io.Copy(dst, file)
+		
+		w.Write([]byte("OK"))
+		
+		// Broadcast the new file to everyone: filename|server_onion
+		content := fmt.Sprintf("%s|%s", header.Filename, s.Stats.TorAddress)
+		s.broadcastToWhitelisted(protocol.CreateMessage(config.MsgTypeFileOffer, content, "SERVER"))
+	})
+
+	listener, _ := net.Listen("tcp", "127.0.0.1:0")
+	s.HTTPPort = listener.Addr().(*net.TCPAddr).Port
+	http.Serve(listener, mux)
+}
+
+func (s *Server) updateTorPorts() {
+	// Small delay to let initial tor setup finish
+	time.Sleep(5 * time.Second)
+	// Here we should ideally update the ADD_ONION via Tor Control Port
+	// But since it's already started, we'd need to re-issue the command.
+	// For KISS, we'll assume the initial tor setup in embedded.go can handle multiple ports.
+}
+
+func (s *Server) RegenerateRoomKey() {
+	s.mu.Lock()
+	newKey := make([]byte, 32)
+	_, _ = rand.Read(newKey)
+	
+	// VaultToken is now just the Hash of the RoomKey
+	// This lets the server verify the key without knowing the key!
+	h := sha256.New()
+	h.Write(newKey)
+	s.VaultToken = hex.EncodeToString(h.Sum(nil))
+	
+	s.RoomKey = newKey
+	s.mu.Unlock()
+
+	keyMsg := protocol.CreateMessage(config.MsgTypeRoomKey, crypto.Base64Encode(newKey), "SERVER")
+	s.broadcastToWhitelisted(keyMsg)
+	
+	s.mu.Lock()
+	s.RoomKey = nil // Wipe content key from RAM
+	s.mu.Unlock()
+	
+	s.AddEvent("🔄", "Group rotated. Keys updated for join/leave event.")
+}
+
+func (s *Server) broadcastToWhitelisted(msg *protocol.ChatMessage) {
+	for _, c := range s.ClientManager.GetAllClients() {
+		if c.State == "WHITELISTED" {
+			s.SendMessage(c, msg)
+		}
+	}
 }

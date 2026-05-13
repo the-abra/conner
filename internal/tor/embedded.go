@@ -9,7 +9,6 @@ import (
 	"github.com/alexballas/go-libtor"
 	"github.com/cretz/bine/control"
 	"github.com/cretz/bine/tor"
-	"io"
 	"net"
 	"time"
 )
@@ -86,38 +85,19 @@ func (et *EmbeddedTor) Stop() {
 	}
 }
 
-func (et *EmbeddedTor) CreateHiddenService(ctx context.Context, localPort int, remotePort int) (string, error) {
-	// Create a hidden service that maps remotePort (usually 80)
-	onion, err := et.Instance.Listen(ctx, &tor.ListenConf{
-		Version3:    true,
-		RemotePorts: []int{remotePort},
+func (et *EmbeddedTor) CreateServerOnion(ctx context.Context, tcpPort, httpPort int) (string, error) {
+	// ADD_ONION NEW:BEST Port=6666,127.0.0.1:tcp Port=80,127.0.0.1:http
+	k, _ := control.KeyFromString("NEW:BEST")
+	obs, err := et.Instance.Control.AddOnion(&control.AddOnionRequest{
+		Key: k,
+		Ports: []*control.KeyVal{
+			control.NewKeyVal("6666", fmt.Sprintf("127.0.0.1:%d", tcpPort)),
+			control.NewKeyVal("80", fmt.Sprintf("127.0.0.1:%d", httpPort)),
+		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to create hidden service: %w", err)
+		return "", fmt.Errorf("failed to add multi-port onion: %w", err)
 	}
 
-	// Proxy traffic from onion listener to localPort
-	go func() {
-		for {
-			conn, err := onion.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				local, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
-				if err != nil {
-					return
-				}
-				defer local.Close()
-				
-				done := make(chan struct{}, 2)
-				go func() { io.Copy(local, c); done <- struct{}{} }()
-				go func() { io.Copy(c, local); done <- struct{}{} }()
-				<-done
-			}(conn)
-		}
-	}()
-
-	return onion.ID + ".onion", nil
+	return obs.ServiceID + ".onion", nil
 }

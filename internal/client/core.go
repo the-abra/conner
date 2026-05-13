@@ -1,8 +1,15 @@
 package client
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +81,9 @@ type Client struct {
 	IdentityStore      *IdentityStore
 	autoSyncOnce       sync.Once
 	P2P                *P2PService // Persistent P2P service
+	RoomKey            []byte      // Centralized AES key (Content)
+	VaultToken         string      // Server access token (Auth)
+	ServerOnion        string      // Onion address of the hub
 }
 
 func (c *Client) StartAutoSync() {
@@ -115,7 +125,7 @@ func (c *Client) StartAutoSync() {
 						c.mu.Unlock()
 
 						go func(p string) {
-							_ = c.SendFile(p)
+							_ = c.UploadToServer(p)
 						}(absPath)
 					}
 				}
@@ -274,6 +284,7 @@ func Connect(nickname, address string) (*Client, error) {
 		UserKeys:           make(map[string][]byte),
 		IdentityStore:      NewIdentityStore(fmt.Sprintf("identities_%s.json", nickname)),
 		P2P:                p2p,
+		ServerOnion:        strings.Split(address, ":")[0],
 	}
 
 	go client.readPump()
@@ -283,29 +294,77 @@ func Connect(nickname, address string) (*Client, error) {
 }
 
 
-func (c *Client) SendFile(filePath string) error {
-	if c.P2P == nil {
-		return fmt.Errorf("P2P service is not running")
-	}
-	absPath, err := filepath.Abs(filePath)
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(absPath); os.IsNotExist(err) {
-		return fmt.Errorf("file not found: %s", filePath)
-	}
+func (c *Client) UploadToServer(filePath string) error {
+	c.mu.Lock()
+	rk := c.RoomKey
+	onion := c.ServerOnion
+	c.mu.Unlock()
 
-	// Broadcast offer to the group: name|onion|token
-	fileName := filepath.Base(absPath)
-	offerMsg := protocol.CreateMessage(config.MsgTypeFileOffer, fmt.Sprintf("%s|%s|%s", fileName, c.P2P.OnionAddr, c.P2P.Token), c.Nickname)
-	c.SendChan <- offerMsg
+	if len(rk) != 32 || onion == "" {
+		return fmt.Errorf("not ready to upload (no key or onion)")
+	}
 
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: fmt.Sprintf("🚀 Shared %s (via %s)", fileName, c.P2P.OnionAddr),
+		Content: "📤 Encrypting and uploading " + filepath.Base(filePath) + "...",
 	})
 
+	// 1. Create temp encrypted file
+	tmpEncFile := filepath.Join(os.TempDir(), "vault_enc_"+filepath.Base(filePath))
+	src, err := os.Open(filePath)
+	if err != nil { return err }
+	defer src.Close()
+
+	dst, err := os.Create(tmpEncFile)
+	if err != nil { return err }
+	
+	// Encrypt stream with current RoomKey
+	if err := crypto.EncryptStream(rk, src, dst); err != nil {
+		dst.Close()
+		os.Remove(tmpEncFile)
+		return err
+	}
+	dst.Close()
+	defer os.Remove(tmpEncFile)
+
+	// 2. Prepare Multipart Form with encrypted file
+	encFile, _ := os.Open(tmpEncFile)
+	defer encFile.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, _ := writer.CreateFormFile("file", filepath.Base(filePath))
+	io.Copy(part, encFile)
+	writer.Close()
+
+	// 3. HTTP Request via Tor
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer, _ := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
+			return dialer.Dial(network, addr)
+		},
+	}
+	httpClient := &http.Client{Transport: transport, Timeout: 1 * time.Hour}
+
+	// Use SHA256 Hash for HTTP Auth
+	url := fmt.Sprintf("http://%s/upload?t=%s", onion, c.VaultToken)
+	req, _ := http.NewRequest("POST", url, body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := httpClient.Do(req)
+	if err != nil { return err }
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		c.sendUpdate(&protocol.ChatMessage{
+			Type:    config.MsgTypeSystem,
+			Sender:  "SYSTEM",
+			Content: "✅ " + filepath.Base(filePath) + " secured and stored in vault.",
+		})
+	} else {
+		return fmt.Errorf("server returned %d", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -322,17 +381,41 @@ func (c *Client) DownloadSharedFile(id string, destDir string) error {
 	})
 
 	destPath := filepath.Join(destDir, info.Name)
+	tmpPath := destPath + ".tmp_enc"
 	os.MkdirAll(destDir, 0755)
 
-	err := DownloadFile(info.Onion, info.Name, info.Token, destPath)
+	// 1. Download encrypted blob using current VaultToken
+	err := DownloadFile(info.Onion, info.Name, c.VaultToken, tmpPath)
 	if err != nil {
+		os.Remove(tmpPath)
 		return err
 	}
+
+	// 2. Decrypt immediately using CURRENT RoomKey (no more metadata tokens)
+	c.mu.Lock()
+	rk := c.RoomKey
+	c.mu.Unlock()
+	if len(rk) != 32 {
+		return fmt.Errorf("invalid decryption key for this file")
+	}
+
+	encFile, err := os.Open(tmpPath)
+	if err != nil { return err }
+	defer encFile.Close()
+
+	outFile, err := os.Create(destPath)
+	if err != nil { return err }
+	defer outFile.Close()
+
+	if err := crypto.DecryptStream(rk, encFile, outFile); err != nil {
+		return fmt.Errorf("decryption failed: %w", err)
+	}
+	os.Remove(tmpPath)
 
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: "✅ Download complete: " + destPath,
+		Content: "✅ Downloaded and decrypted: " + destPath,
 	})
 
 	c.sendUpdate(&protocol.ChatMessage{
@@ -387,6 +470,44 @@ func (c *Client) readPump() {
 			continue
 		}
 
+		// Unified Key Update: Calculate SHA256 hash for Vault Access
+		if msg.Type == config.MsgTypeRoomKey {
+			key, _ := crypto.Base64Decode(msg.Content)
+			if len(key) == 32 {
+				h := sha256.New()
+				h.Write(key)
+				hash := hex.EncodeToString(h.Sum(nil))
+
+				c.mu.Lock()
+				c.RoomKey = key
+				c.VaultToken = hash
+				c.mu.Unlock()
+				c.sendUpdate(&protocol.ChatMessage{
+					Type:    config.MsgTypeSystem,
+					Sender:  "SECURITY",
+					Content: "🔐 New Room Key synced. Access Token rotated.",
+				})
+			}
+			continue
+		}
+
+		// Decrypt Group Messages (Chat/FileOffer)
+		if (msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypeFileOffer) && msg.Sender != c.Nickname {
+			c.mu.Lock()
+			rk := c.RoomKey
+			c.mu.Unlock()
+			
+			if len(rk) == 32 {
+				encContent, _ := crypto.Base64Decode(msg.Content)
+				decContent, err := crypto.Decrypt(rk, encContent)
+				if err == nil {
+					msg.Content = string(decContent)
+				} else {
+					msg.Content = "[Decryption Failed - Waiting for new Room Key...]"
+				}
+			}
+		}
+
 		if msg.Type == config.MsgTypeUserList {
 			for _, p := range strings.Split(msg.Content, ",") {
 				parts := strings.Split(p, "|")
@@ -427,11 +548,10 @@ func (c *Client) readPump() {
 
 		if msg.Type == config.MsgTypeFileOffer {
 			parts := strings.Split(msg.Content, "|")
-			if len(parts) >= 3 {
+			if len(parts) >= 2 {
 				info := OnionInfo{
 					Name:  parts[0],
 					Onion: parts[1],
-					Token: parts[2],
 				}
 				c.mu.Lock()
 				if c.AvailableFiles == nil {
@@ -464,6 +584,18 @@ func (c *Client) sendUpdate(msg *protocol.ChatMessage) {
 
 func (c *Client) writePump() {
 	for chatMsg := range c.SendChan {
+		// Encrypt with RoomKey if it's a chat message
+		if chatMsg.Type == config.MsgTypeChat || chatMsg.Type == config.MsgTypeFileOffer {
+			c.mu.Lock()
+			rk := c.RoomKey
+			c.mu.Unlock()
+			
+			if len(rk) == 32 {
+				encContent, _ := crypto.Encrypt(rk, []byte(chatMsg.Content))
+				chatMsg.Content = crypto.Base64Encode(encContent)
+			}
+		}
+
 		jsonBytes, _ := chatMsg.Encode()
 		enc, _ := crypto.Encrypt(c.SessionKey, jsonBytes)
 		protocol.SendFrame(c.Conn, []byte(crypto.Base64Encode(enc)))

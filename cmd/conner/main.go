@@ -91,23 +91,24 @@ func main() {
 
 func runServer() {
 	srv := server.NewServer()
-	if serverOnion != "" {
-		srv.Stats.TorAddress = serverOnion
-	}
-
+	
 	startErr := make(chan error, 1)
 	go func() {
 		startErr <- srv.Start(config.ServerPort)
 	}()
 
-	// Wait a moment for potential bind errors
-	time.Sleep(500 * time.Millisecond)
-	select {
-	case err := <-startErr:
-		log.SetOutput(os.Stderr)
-		log.Fatalf("Server failed to start: %v", err)
-	default:
-		// Server seems up
+	// Wait for server to start and bind its HTTP port
+	time.Sleep(1 * time.Second)
+
+	if embeddedTor != nil {
+		fmt.Println("[*] Generating Multi-Port Server Onion...")
+		onion, err := embeddedTor.CreateServerOnion(context.Background(), 6666, srv.HTTPPort)
+		if err != nil {
+			log.Fatalf("Failed to create multi-port onion: %v", err)
+		}
+		srv.Stats.TorAddress = onion
+		serverOnion = onion
+		fmt.Printf("[+] Server Onion is READY: %s\n", onion)
 	}
 
 	log.SetOutput(io.Discard)
@@ -221,12 +222,7 @@ func startTor(isServer bool) error {
 	config.TorSocksAddr = et.SocksAddr
 
 	if isServer {
-		fmt.Println("[*] Generating Ephemeral Hidden Service...")
-		onion, err := et.CreateHiddenService(context.Background(), 6666, 80)
-		if err != nil {
-			return fmt.Errorf("failed to create hidden service: %w", err)
-		}
-		serverOnion = onion
+		// Onion creation moved to runServer to wait for srv.HTTPPort
 	}
 
 	fmt.Println("[+] Tor is UP. Address: " + serverOnion)
