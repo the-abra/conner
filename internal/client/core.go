@@ -1,8 +1,6 @@
 package client
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -56,7 +54,6 @@ type OnionInfo struct {
 	Name       string
 	Onion      string
 	Token      string
-	FileKeyHex string
 }
 
 type Client struct {
@@ -70,19 +67,13 @@ type Client struct {
 	PendingDownloadDir chan string               // TUI pushes destDir before sending DOWNLOAD_REQ
 	sharedFiles        map[string]string         // filename -> absolute path
 	AvailableFiles     map[string]OnionInfo      // id -> OnionInfo
+	// Security items
 	SigningPriv        []byte                    // Ed25519 Private Key for identity
 	SigningPub         []byte                    // Ed25519 Public Key for identity
-
-	// E2E items
-	E2EPriv            []byte
-	E2EPub             []byte
-	UserKeys           map[string][]byte          // Other users' E2E public keys
-	MyRatchet          *crypto.Ratchet            // Used to encrypt outgoing group messages
-	SenderRatchets     map[string]*crypto.Ratchet // Used to decrypt incoming group messages
-
-	autoSyncOnce       sync.Once
-	sharedWith         map[string]bool // Track who we have shared our ratchet key with
+	UserKeys           map[string][]byte          // Other users' Identity public keys
 	IdentityStore      *IdentityStore
+	autoSyncOnce       sync.Once
+	P2P                *P2PService // Persistent P2P service
 }
 
 func (c *Client) StartAutoSync() {
@@ -133,25 +124,13 @@ func (c *Client) StartAutoSync() {
 	})
 }
 
-func loadIdentityKeys() (pub []byte, priv []byte) {
-	keyFile := "identity.key"
+func loadIdentityKeys(nick string) (pub []byte, priv []byte) {
+	keyFile := fmt.Sprintf("identity_%s.key", nick)
 	if data, err := os.ReadFile(keyFile); err == nil && len(data) == 64 {
 		return data[32:], data[:64]
 	}
 	p, s, _ := crypto.GenerateSigningKeyPair()
 	_ = os.WriteFile(keyFile, s, 0600)
-	return p, s
-}
-
-func loadE2EKeys() (pub []byte, priv []byte) {
-	keyFile := "e2e.key"
-	if data, err := os.ReadFile(keyFile); err == nil && len(data) == 64 {
-		return data[32:], data[:64]
-	}
-	s, p, _ := crypto.GenerateKeyPair()
-	// priv then pub
-	combined := append(s, p...)
-	_ = os.WriteFile(keyFile, combined, 0600)
 	return p, s
 }
 
@@ -239,7 +218,7 @@ func Connect(nickname, address string) (*Client, error) {
 	sessionKey, _ := crypto.DeriveSharedKey(priv, serverPub)
 
 	// 2. Sign Challenge
-	idPub, idPriv := loadIdentityKeys()
+	idPub, idPriv := loadIdentityKeys(nickname)
 	sig := crypto.Sign(idPriv, nonce)
 
 	// 2. Send CLIENT_HELLO
@@ -252,16 +231,13 @@ func Connect(nickname, address string) (*Client, error) {
 		identity = strings.Split(conn.LocalAddr().String(), ":")[0]
 	}
 
-	e2ePub, e2ePriv := loadE2EKeys()
-
-	hello := fmt.Sprintf("CLIENT_HELLO:%s:%s:%s:%s:%s:%s:%s",
+	hello := fmt.Sprintf("CLIENT_HELLO:%s:%s:%s:%s:%s:%s",
 		crypto.Base64Encode(pub),
 		nickname,
 		identity,
 		crypto.Base64Encode(idPub),
 		crypto.Base64Encode(sig),
-		crypto.Base64Encode(powNonceBytes),
-		crypto.Base64Encode(e2ePub))
+		crypto.Base64Encode(powNonceBytes))
 
 	if err := protocol.SendFrame(conn, []byte(hello)); err != nil {
 		return nil, fmt.Errorf("handshake: CLIENT_HELLO send failed: %w", err)
@@ -277,6 +253,12 @@ func Connect(nickname, address string) (*Client, error) {
 		return nil, fmt.Errorf("handshake: expected HANDSHAKE_OK, got: %s", respLine)
 	}
 
+	// 1. Initialize P2P Service once
+	p2p, p2pErr := StartP2PService("uploads")
+	if p2pErr != nil {
+		fmt.Printf("[!] P2P Service failed to start: %v\n", p2pErr)
+	}
+
 	client := &Client{
 		Conn:               conn,
 		SessionKey:         sessionKey,
@@ -284,17 +266,14 @@ func Connect(nickname, address string) (*Client, error) {
 		Nickname:           nickname,
 		SendChan:           make(chan *protocol.ChatMessage, 10),
 		UpdateChan:         make(chan *protocol.ChatMessage, 200),
-		PendingDownloadDir: make(chan string, 10), // buffered so TUI never blocks
+		PendingDownloadDir: make(chan string, 10),
 		sharedFiles:        make(map[string]string),
 		AvailableFiles:     make(map[string]OnionInfo),
 		SigningPub:         idPub,
 		SigningPriv:        idPriv,
-		E2EPriv:            e2ePriv,
-		E2EPub:             e2ePub,
 		UserKeys:           make(map[string][]byte),
-		MyRatchet:          crypto.NewRatchet(crypto.GenerateRandomKey()),
-		SenderRatchets:     make(map[string]*crypto.Ratchet),
-		IdentityStore:      NewIdentityStore("identities.json"),
+		IdentityStore:      NewIdentityStore(fmt.Sprintf("identities_%s.json", nickname)),
+		P2P:                p2p,
 	}
 
 	go client.readPump()
@@ -305,6 +284,9 @@ func Connect(nickname, address string) (*Client, error) {
 
 
 func (c *Client) SendFile(filePath string) error {
+	if c.P2P == nil {
+		return fmt.Errorf("P2P service is not running")
+	}
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return err
@@ -313,49 +295,15 @@ func (c *Client) SendFile(filePath string) error {
 		return fmt.Errorf("file not found: %s", filePath)
 	}
 
-	// Open source file for streaming
-	src, err := os.Open(absPath)
-	if err != nil {
-		return fmt.Errorf("could not open file: %w", err)
-	}
-	defer src.Close()
-
-	// Generate AES Key
-	fileKey := make([]byte, 32)
-	_, _ = rand.Read(fileKey)
-
-	// Create temp encrypted file
-	tmpFile := filepath.Join(os.TempDir(), "enc_"+filepath.Base(absPath))
-	dst, err := os.Create(tmpFile)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-
-	// Stream encryption (No more RAM spikes!)
-	if err := crypto.EncryptStream(fileKey, src, dst); err != nil {
-		dst.Close()
-		return fmt.Errorf("streaming encryption failed: %w", err)
-	}
-	dst.Close()
-
-
-	token := GenerateToken()
-	onion, err := StartEphemeralService(tmpFile, token)
-	if err != nil {
-		return fmt.Errorf("P2P service failed: %w", err)
-	}
-
-	// Broadcast offer to the group
+	// Broadcast offer to the group: name|onion|token
 	fileName := filepath.Base(absPath)
-	hexKey := hex.EncodeToString(fileKey)
-	offerMsg := protocol.CreateMessage(config.MsgTypeFileOffer, fmt.Sprintf("%s|%s|%s|%s", fileName, onion, token, hexKey), c.Nickname)
-	offerMsg.IsE2Ee = true
+	offerMsg := protocol.CreateMessage(config.MsgTypeFileOffer, fmt.Sprintf("%s|%s|%s", fileName, c.P2P.OnionAddr, c.P2P.Token), c.Nickname)
 	c.SendChan <- offerMsg
 
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: fmt.Sprintf("🚀 Hosting %s at %s (E2EE Active).", fileName, onion),
+		Content: fmt.Sprintf("🚀 Shared %s (via %s)", fileName, c.P2P.OnionAddr),
 	})
 
 	return nil
@@ -370,50 +318,21 @@ func (c *Client) DownloadSharedFile(id string, destDir string) error {
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: "⏳ Downloading " + info.Name + " from " + info.Onion + " [E2EE]...",
+		Content: "⏳ Downloading " + info.Name + " from " + info.Onion + "...",
 	})
 
 	destPath := filepath.Join(destDir, info.Name)
 	os.MkdirAll(destDir, 0755)
 
-	tmpPath := destPath + ".enc"
-	err := DownloadFile(info.Onion, info.Token, tmpPath)
+	err := DownloadFile(info.Onion, info.Name, info.Token, destPath)
 	if err != nil {
 		return err
-	}
-
-	// E2EE Decryption
-	if info.FileKeyHex != "" {
-		keyBytes, err := hex.DecodeString(info.FileKeyHex)
-		if err == nil && len(keyBytes) == 32 {
-			encFile, err := os.Open(tmpPath)
-			if err != nil {
-				return err
-			}
-			defer encFile.Close()
-
-			outFile, err := os.Create(destPath)
-			if err != nil {
-				return err
-			}
-			defer outFile.Close()
-
-			if err := crypto.DecryptStream(keyBytes, encFile, outFile); err != nil {
-				return fmt.Errorf("streaming decryption failed: %w", err)
-			}
-			os.Remove(tmpPath)
-		} else {
-			return fmt.Errorf("invalid file key")
-		}
-	} else {
-		// Fallback
-		os.Rename(tmpPath, destPath)
 	}
 
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: "✅ Download complete & decrypted: " + destPath,
+		Content: "✅ Download complete: " + destPath,
 	})
 
 	c.sendUpdate(&protocol.ChatMessage{
@@ -468,60 +387,22 @@ func (c *Client) readPump() {
 			continue
 		}
 
-		if msg.Type == config.MsgTypeKeyShare && msg.IsE2Ee {
-			// Decrypt the shared Sender Key
-			senderE2E, ok := c.UserKeys[msg.Sender]
-			if ok {
-				shared, _ := crypto.DeriveSharedKey(c.E2EPriv, senderE2E)
-				encBlob, _ := crypto.Base64Decode(msg.Content)
-				decKey, err := crypto.Decrypt(shared, encBlob)
-				if err == nil && len(decKey) == 32 {
-					c.SenderRatchets[msg.Sender] = crypto.NewRatchet(decKey)
-					// Reciprocate key share to ensure bilateral sync
-					c.ShareKeyWith(msg.Sender)
-				}
-			}
-			continue
-		}
-
-		if (msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypeFileOffer) && msg.Sender != c.Nickname {
-			senderRatchet, ok := c.SenderRatchets[msg.Sender]
-			if ok {
-				msgKey, err := senderRatchet.GetMessageKey(msg.RatchetStep)
-				if err == nil {
-					encContent, _ := crypto.Base64Decode(msg.Content)
-					decContent, err := crypto.Decrypt(msgKey, encContent)
-					if err == nil {
-						msg.Content = string(decContent)
-					} else {
-						msg.Content = "[E2EE Decryption Failed - Resyncing...]"
-						c.ShareKeyWith(msg.Sender)
-					}
-				} else {
-					msg.Content = "[E2EE Ratchet Desync - Resyncing...]"
-					c.ShareKeyWith(msg.Sender)
-				}
-			} else {
-				msg.Content = "[E2EE Syncing...]"
-				c.ShareKeyWith(msg.Sender)
-			}
-		}
-
 		if msg.Type == config.MsgTypeUserList {
 			for _, p := range strings.Split(msg.Content, ",") {
-				parts := strings.SplitN(p, "|", 2)
-				if len(parts) == 2 {
+				parts := strings.Split(p, "|")
+				if len(parts) >= 2 {
 					nick := parts[0]
-					pubB64 := parts[1]
-					pub, err := crypto.Base64Decode(pubB64)
-					if err == nil && len(pub) == 32 {
-						// TOFU: Trust On First Use Identity Check
-						isOK, isNew := c.IdentityStore.Check(nick, pubB64)
+					signingB64 := parts[1]
+					
+					signingPub, _ := crypto.Base64Decode(signingB64)
+
+					if len(signingPub) == 32 {
+						isOK, isNew := c.IdentityStore.Check(nick, signingB64)
 						if !isOK {
 							c.sendUpdate(&protocol.ChatMessage{
 								Type:    config.MsgTypeSystem,
 								Sender:  "SECURITY",
-								Content: fmt.Sprintf("🚨 WARNING: %s has changed their identity key! (Potential MITM)", nick),
+								Content: fmt.Sprintf("🚨 WARNING: %s has changed their identity key!", nick),
 							})
 							continue 
 						}
@@ -529,18 +410,10 @@ func (c *Client) readPump() {
 							c.sendUpdate(&protocol.ChatMessage{
 								Type:    config.MsgTypeSystem,
 								Sender:  "SECURITY",
-								Content: fmt.Sprintf("🛡️ New identity discovered: %s (Pinned)", nick),
+								Content: fmt.Sprintf("🛡️ New identity discovered: %s", nick),
 							})
 						}
-
-						// If key changed or unknown, share our key to re-establish trust
-						oldKey, exists := c.UserKeys[nick]
-						c.UserKeys[nick] = pub
-						if nick != c.Nickname {
-							if !exists || crypto.Base64Encode(oldKey) != pubB64 {
-								c.ShareKeyWith(nick)
-							}
-						}
+						c.UserKeys[nick] = signingPub
 					}
 				}
 			}
@@ -553,54 +426,25 @@ func (c *Client) readPump() {
 		}
 
 		if msg.Type == config.MsgTypeFileOffer {
-			if msg.Content == "[E2EE Missing Sender Key]" {
-				continue
-			}
 			parts := strings.Split(msg.Content, "|")
 			if len(parts) >= 3 {
-				name := parts[0]
-				onion := parts[1]
-				token := parts[2]
-				
-				fileKeyHex := ""
-				if len(parts) >= 4 {
-					fileKeyHex = parts[3]
+				info := OnionInfo{
+					Name:  parts[0],
+					Onion: parts[1],
+					Token: parts[2],
 				}
-				
 				c.mu.Lock()
 				if c.AvailableFiles == nil {
 					c.AvailableFiles = make(map[string]OnionInfo)
 				}
-				id := fmt.Sprintf("%d", len(c.AvailableFiles))
-				c.AvailableFiles[id] = OnionInfo{
-					Name: name,
-					Onion: onion,
-					Token: token,
-					FileKeyHex: fileKeyHex,
-				}
+				c.AvailableFiles[msg.Sender] = info
 				c.mu.Unlock()
 				
 				c.sendUpdate(&protocol.ChatMessage{
 					Type:    config.MsgTypeSystem,
-					Sender:  "SYSTEM",
-					Content: fmt.Sprintf("📎 %s shared a file: %s (ID: %s) [E2EE]", msg.Sender, name, id),
+					Sender:  "P2P",
+					Content: fmt.Sprintf("🎁 %s is sharing a file: %s (Type /download %s to get it)", msg.Sender, info.Name, msg.Sender),
 				})
-
-				// Auto-Download if not sender
-				if msg.Sender != c.Nickname {
-					// Deduplication check: check if it already exists in uploads/ or downloads/
-					if _, err := os.Stat(filepath.Join("uploads", name)); err == nil {
-						continue // We already have it in uploads
-					}
-					if _, err := os.Stat(filepath.Join("downloads", name)); err == nil {
-						continue // We already have it in downloads
-					}
-
-					go func(fileID string) {
-						time.Sleep(2 * time.Second) // Small delay to let Tor stabilize
-						_ = c.DownloadSharedFile(fileID, "downloads")
-					}(id)
-				}
 			}
 			continue
 		}
@@ -618,29 +462,8 @@ func (c *Client) sendUpdate(msg *protocol.ChatMessage) {
 	}
 }
 
-func (c *Client) ShareKeyWith(targetNick string) {
-	targetE2E, ok := c.UserKeys[targetNick]
-	if ok {
-		shared, _ := crypto.DeriveSharedKey(c.E2EPriv, targetE2E)
-		initialKey := c.MyRatchet.GetInitialKey()
-		enc, _ := crypto.Encrypt(shared, initialKey)
-		
-		msg := protocol.CreateMessage(config.MsgTypeKeyShare, targetNick+"|"+crypto.Base64Encode(enc), c.Nickname)
-		msg.IsE2Ee = true
-		c.SendChan <- msg
-	}
-}
-
 func (c *Client) writePump() {
 	for chatMsg := range c.SendChan {
-		// Only encrypt with ratchet if it's chat/file and NOT a server command
-		if (chatMsg.Type == config.MsgTypeChat || chatMsg.Type == config.MsgTypeFileOffer) && !strings.HasPrefix(chatMsg.Content, "/") {
-			msgKey, step := c.MyRatchet.Next()
-			encContent, _ := crypto.Encrypt(msgKey, []byte(chatMsg.Content))
-			chatMsg.Content = crypto.Base64Encode(encContent)
-			chatMsg.RatchetStep = step
-		}
-
 		jsonBytes, _ := chatMsg.Encode()
 		enc, _ := crypto.Encrypt(c.SessionKey, jsonBytes)
 		protocol.SendFrame(c.Conn, []byte(crypto.Base64Encode(enc)))

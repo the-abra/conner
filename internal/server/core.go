@@ -267,8 +267,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	parts := strings.SplitN(line, ":", 8)
-	if len(parts) != 8 {
+	parts := strings.SplitN(line, ":", 7)
+	if len(parts) != 7 {
 		conn.Close()
 		return
 	}
@@ -305,7 +305,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 	identity := parts[3]
 	clientSigningPub, _ := crypto.Base64Decode(parts[4])
 	clientSig, _ := crypto.Base64Decode(parts[5])
-	e2ePub, _ := crypto.Base64Decode(parts[7])
 
 	// Verify Identity Signature
 	if !crypto.Verify(clientSigningPub, nonce, clientSig) {
@@ -361,7 +360,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 		SendChan:      make(chan string, 100),
 		LastSeen:      time.Now(),
 		SigningPubKey: clientSigningPub,
-		E2EPubKey:     e2ePub,
 	}
 
 	if isKeyWhitelisted {
@@ -499,22 +497,8 @@ func (s *Server) processClientMessage(client *Client, text string) {
 	}
 
 
-	if (msg.Type == config.MsgTypePrivate || msg.Type == config.MsgTypeKeyShare) && msg.IsE2Ee {
-		parts := strings.SplitN(msg.Content, "|", 2)
-		if len(parts) == 2 {
-			targetNick := parts[0]
-			blob := parts[1]
-			target := s.ClientManager.GetClientByNickname(targetNick)
-			if target != nil {
-				relay := protocol.CreateMessage(msg.Type, blob, client.Nickname)
-				relay.IsE2Ee = true
-				s.SendMessage(target, relay)
-			}
-		}
-		return
-	}
-
-	if strings.HasPrefix(msg.Content, "/") {
+	// Handle Admin Commands
+	if msg.Type == config.MsgTypeChat && strings.HasPrefix(msg.Content, "/") {
 		s.handleCommand(client, msg.Content)
 		return
 	}
@@ -552,8 +536,10 @@ func (s *Server) BroadcastUserList() {
 	var userInfos []string
 	for _, c := range s.ClientManager.GetAllClients() {
 		if c.State == "WHITELISTED" {
-			// nick|e2e_pub_b64
-			userInfos = append(userInfos, c.Nickname+"|"+crypto.Base64Encode(c.E2EPubKey))
+			// nick|signing_pub_b64
+			userInfos = append(userInfos, fmt.Sprintf("%s|%s", 
+				c.Nickname, 
+				crypto.Base64Encode(c.SigningPubKey)))
 		}
 	}
 	userList := strings.Join(userInfos, ",")
