@@ -19,10 +19,10 @@ rc-service syslog stop
 find /var/log -type f -exec truncate -s 0 {} \;
 ```
 
-## 3. Application Setup & Network Hardening
+3. Application Setup & Network Hardening
  
 CONNER is designed for **Zero-Touch Deployment**. 
-- **Internal Tor HS**: The application starts its own Tor motor and generates a `.onion` address automatically. 
+- **Internal Tor HS**: When started with the `--tor` flag, the application starts its own Tor motor and generates a `.onion` address automatically. 
 - **No Reverse Proxy**: Direct connection from Tor to the backend port ensures no extra points of failure or logging.
 - **Rootless Operation**: You can run the server as a regular user, which is safer for anonymity (less fingerprinting of the host system).
 
@@ -32,13 +32,13 @@ For maximum security, CONNER should be run within a containerized or isolated en
 
 1. **Containerization**: Use the provided Dockerfile. It runs the server as a non-privileged user and mounts critical paths as `tmpfs` (RAM-disk).
 2. **Restricted Shell**: If running on bare metal, manually create a restricted shell environment or use `jailkit` to prevent lateral movement if the application is compromised.
-3. **No Persistence**: By default, CONNER stores message history in RAM. A simple restart or power loss wipes all evidence of recent communications.
+3. **No Persistence**: By default, CONNER stores message history in RAM (MemoryManager). A simple restart or power loss wipes all evidence of recent communications.
 
 ## 5. Panic Switch & Data Destruction
 
-In case of a physical or digital breach, use the `/burn` command from any authorized admin client. 
-- **Server-side**: The server should be configured with `shred` to wipe session keys.
-- **Client-side**: The `/burn` command wipes the `identity.key` and `downloads/` directory using multiple passes.
+In case of a physical or digital breach, use the `/burn` command from any authorized client. 
+- **Server-side**: The server should be configured with `shred` to wipe session history.
+- **Client-side**: The `/burn` command wipes the `identity.key` using multiple passes and immediately terminates the process.
 
 ## 6. Maintenance
 

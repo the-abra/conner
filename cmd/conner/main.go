@@ -29,7 +29,10 @@ var serverOnion string
 
 func main() {
 	isServer := flag.Bool("server", false, "Run in server mode")
+	useTor := flag.Bool("tor", false, "Enable Tor integration (Onion service / SOCKS proxy)")
 	stealth := flag.Bool("stealth", false, "Enable anti-forensics and stealth mode")
+	srvPort := flag.String("port", "6666", "Server port to listen on (default 6666)")
+	flag.StringVar(srvPort, "p", "6666", "Server port to listen on (shorthand)")
 	
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage (Client): %s [options] <nickname> [address:port]\n", os.Args[0])
@@ -42,8 +45,12 @@ func main() {
 		fmt.Printf("[!] Auto-setup warning: %v\n", err)
 	}
 
-	if err := startTor(*isServer); err != nil {
-		log.Fatalf("[!] Tor initialization failed: %v", err)
+	if *useTor {
+		if err := startTor(*isServer); err != nil {
+			log.Fatalf("[!] Tor initialization failed: %v", err)
+		}
+	} else {
+		fmt.Println("[*] Tor is disabled. Running in direct-connection mode.")
 	}
 
 	if *stealth {
@@ -58,9 +65,9 @@ func main() {
 	// Port sanity checks
 	var ports []string
 	if *isServer {
-		ports = append(ports, config.ServerPort)
+		ports = append(ports, *srvPort)
 	} else {
-		ports = append(ports, "8888") // P2P Hosting port
+		ports = append(ports, "8888") // Local P2P Port
 	}
 	for _, p := range ports {
 		if err := checkPortAvailability(p); err != nil {
@@ -69,19 +76,9 @@ func main() {
 	}
 
 	if *isServer {
-		if serverOnion != "" {
-			fmt.Println("\n" + strings.Repeat("=", 60))
-			fmt.Println("  CONNER SERVER IS READY")
-			fmt.Println(strings.Repeat("=", 60))
-			fmt.Printf("  YOUR ONION ADDRESS: %s\n", serverOnion)
-			fmt.Println(strings.Repeat("=", 60))
-			fmt.Println("  (You can copy the address now)")
-			fmt.Print("  Press [ENTER] to launch the Admin Dashboard...")
-			fmt.Scanln()
-		}
-		runServer()
+		runServer(*srvPort)
 	} else {
-		runClient()
+		runClient(*useTor)
 	}
 
 	if embeddedTor != nil {
@@ -89,26 +86,46 @@ func main() {
 	}
 }
 
-func runServer() {
+func runServer(port string) {
 	srv := server.NewServer()
 	
 	startErr := make(chan error, 1)
 	go func() {
-		startErr <- srv.Start(config.ServerPort)
+		startErr <- srv.Start(port)
 	}()
 
 	// Wait for server to start and bind its HTTP port
 	time.Sleep(1 * time.Second)
 
 	if embeddedTor != nil {
-		fmt.Println("[*] Generating Multi-Port Server Onion...")
-		onion, err := embeddedTor.CreateServerOnion(context.Background(), 6666, srv.HTTPPort)
+		fmt.Println("[*] Generating Server Onion...")
+		pInt := 6666
+		fmt.Sscanf(port, "%d", &pInt)
+		onion, err := embeddedTor.CreateServerOnion(context.Background(), pInt)
 		if err != nil {
-			log.Fatalf("Failed to create multi-port onion: %v", err)
+			log.Fatalf("Failed to create onion: %v", err)
 		}
 		srv.Stats.TorAddress = onion
 		serverOnion = onion
-		fmt.Printf("[+] Server Onion is READY: %s\n", onion)
+	}
+
+	if serverOnion != "" {
+		fmt.Println("\n" + strings.Repeat("=", 60))
+		fmt.Println("  CONNER SERVER IS READY (TOR MODE)")
+		fmt.Println(strings.Repeat("=", 60))
+		fmt.Printf("  YOUR ONION ADDRESS: %s:%s\n", serverOnion, port)
+		fmt.Println(strings.Repeat("=", 60))
+		fmt.Println("  (You can copy the address now)")
+		fmt.Print("  Press [ENTER] to launch the Admin Dashboard...")
+		fmt.Scanln()
+	} else {
+		fmt.Println("\n" + strings.Repeat("=", 60))
+		fmt.Println("  CONNER SERVER IS READY (DIRECT MODE)")
+		fmt.Println(strings.Repeat("=", 60))
+		fmt.Printf("  LISTENING ON: 0.0.0.0:%s\n", port)
+		fmt.Println(strings.Repeat("=", 60))
+		fmt.Print("  Press [ENTER] to launch the Admin Dashboard...")
+		fmt.Scanln()
 	}
 
 	log.SetOutput(io.Discard)
@@ -120,7 +137,7 @@ func runServer() {
 	}
 }
 
-func runClient() {
+func runClient(useTor bool) {
 	args := flag.Args()
 	if len(args) < 1 {
 		flag.Usage()
@@ -133,7 +150,12 @@ func runClient() {
 		address = args[1]
 	}
 
-	cli, err := client.Connect(nickname, address)
+	// AUTO-PORT: If no port is specified, default to 6666
+	if address != "" && !strings.Contains(address, ":") {
+		address = address + ":6666"
+	}
+
+	cli, err := client.Connect(nickname, address, useTor)
 	if err != nil {
 		if err == client.ErrBanned {
 			p := tea.NewProgram(clienttui.InitialModel(nil, nickname), tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -145,7 +167,6 @@ func runClient() {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 
-	cli.StartAutoSync()
 
 	p := tea.NewProgram(clienttui.InitialModel(cli, nickname), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {

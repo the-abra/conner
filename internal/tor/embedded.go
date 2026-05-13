@@ -85,19 +85,17 @@ func (et *EmbeddedTor) Stop() {
 	}
 }
 
-func (et *EmbeddedTor) CreateServerOnion(ctx context.Context, tcpPort, httpPort int) (string, error) {
-	// ADD_ONION NEW:BEST Port=6666,127.0.0.1:tcp Port=80,127.0.0.1:http
+func (et *EmbeddedTor) CreateServerOnion(ctx context.Context, tcpPort int) (string, error) {
+	// ADD_ONION NEW:BEST Port=6666,127.0.0.1:tcp
 	k, _ := control.KeyFromString("NEW:BEST")
 	obs, err := et.Instance.Control.AddOnion(&control.AddOnionRequest{
 		Key: k,
 		Ports: []*control.KeyVal{
-			control.NewKeyVal("6666", fmt.Sprintf("127.0.0.1:%d", tcpPort)),
-			control.NewKeyVal("80", fmt.Sprintf("127.0.0.1:%d", httpPort)),
+			control.NewKeyVal(fmt.Sprintf("%d", tcpPort), fmt.Sprintf("127.0.0.1:%d", tcpPort)),
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to add multi-port onion: %w", err)
+		return "", fmt.Errorf("failed to add onion: %w", err)
 	}
-
 	return obs.ServiceID + ".onion", nil
 }

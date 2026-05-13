@@ -6,7 +6,7 @@ This document outlines the operational lifecycle of the CONNER P2P system, from 
 
 CONNER does not use passwords. Instead, it uses **Ed25519 Identity Keys**.
 
-1. **Discovery**: The Client connects to the Server's `.onion` address (Port 80).
+1. **Discovery**: The Client connects to the Server's address (Onion or IP, Port 6666).
 2. **Challenge**: The Server sends a unique 32-byte random `Nonce` (challenge).
 3. **Proof**: The Client signs this `Nonce` with its private identity key and sends back:
     - Public Identity Key
@@ -20,32 +20,31 @@ The system uses a **Centralized Star Topology with End-to-End Encryption (E2EE)*
 
 ```mermaid
 graph TD
-    A[Client A] -- Encrypted Blob --> S[Server Relay]
-    B[Client B] -- Encrypted Blob --> S
-    C[Client C] -- Encrypted Blob --> S
+    A[Client A] -- Encrypted JSON --> S[Server Relay]
+    B[Client B] -- Encrypted JSON --> S
+    C[Client C] -- Encrypted JSON --> S
     S -- Forward Blob --> B
     S -- Forward Blob --> C
 ```
 
 ### Server Role:
-- **Traffic Routing**: Forwarding packets based on destination IDs.
+- **Traffic Routing**: Forwarding JSON packets based on destination IDs.
 - **Access Control**: Managing the Whitelist/Blacklist.
-- **Persistence**: Storing the *encrypted* message history so new users can catch up.
-- **Isolation**: In `--stealth` mode, the server uses NGINX to strip all TCP metadata, making the traffic look like a generic, non-identifiable stream.
+- **Persistence**: Storing the *encrypted* message history (in-memory) so new users can catch up.
 
 ### Client Role:
-- **Key Management**: Generating and storing the shared group keys.
-- **Encryption**: Encrypting "Hello" into a ciphertext blob (e.g., `4YWnNrYy...`) using AES-256-GCM.
+- **Key Management**: Managing the shared Room Keys.
+- **Encryption**: Encrypting message content into a ciphertext blob using AES-256-GCM.
 - **Decryption**: Converting received blobs back into human-readable text.
 
 ## 3. Message Lifecycle
 
 1. **Input**: User `abra` types `Hello` in the TUI.
-2. **Encryption**: Client A uses the **Group Key** (shared among trusted members) to encrypt the string.
-3. **Framing**: The encrypted blob is wrapped in a `conner.proto` binary frame.
-4. **Transmission**: The frame is sent over the Tor circuit to the Server.
+2. **Encryption**: Client A uses the **Room Key** (distributed by the server to trusted members) to encrypt the string.
+3. **Framing**: The encrypted blob is wrapped in a JSON message frame.
+4. **Transmission**: The frame is sent over the network (Tor or Direct) to the Server.
 5. **Relay**: The Server receives the frame, identifies it as a `MsgTypeChat`, and broadcasts it to all other "WHITELISTED" clients.
-6. **Reception**: Client B receives the frame, extracts the blob, and uses the same **Group Key** to decrypt it.
+6. **Reception**: Client B receives the frame, extracts the blob, and uses the same **Room Key** to decrypt it.
 7. **Display**: "Hello" appears on Client B's TUI.
 
 ## 4. Why this is Secure?

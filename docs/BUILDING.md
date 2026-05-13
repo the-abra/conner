@@ -16,12 +16,11 @@ CONNER is designed for **Zero-Dependency** operation. All critical components ar
 
 | Component | Required For | Status |
 |-----------|--------------|--------|
-| `tor` | Network & P2P | **Embedded** |
+| `tor` | Network Anonymity | **Embedded** |
 | `coreutils` | Secure deletion (`shred`) | Optional |
-| `img2sixel` | Image rendering | Optional |
 
 ### Auto-Setup
-The binary includes a minimal `autoSetup` feature that checks for optional tools (`shred`, `img2sixel`) and warns if they are missing. It no longer attempts to install packages via system managers, ensuring it can run without root privileges.
+The binary includes a minimal `autoSetup` feature that checks for the `shred` tool and warns if it's missing. It runs without root privileges.
 
 ## Automated Pipelines (laction)
 
@@ -58,8 +57,7 @@ The recommended way to deploy a CONNER server is via Docker:
    docker run -d \
      --name conner-server \
      --cap-add=NET_ADMIN \
-     -p 80:80 \
-     conner:latest
+     conner:latest --server --tor
    ```
 
 Note: `--cap-add=NET_ADMIN` is required for `iptables` to function correctly within the container.

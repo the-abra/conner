@@ -10,7 +10,6 @@ import (
 	"conner/internal/config"
 	"conner/internal/protocol"
 
-	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -102,37 +101,32 @@ type model struct {
 	height         int
 	input          textinput.Model
 	viewport       viewport.Model
-	fp             filepicker.Model
-	showFilePicker bool
 	lines          []string // rendered lines in the viewport
 	showHelp       bool
-	isUploading    bool
 	state          string // PENDING, WHITELISTED
 	onlineUsers    []string
 	isAdmin        bool
 }
 
 func InitialModel(c *client.Client, nick string) tea.Model {
-	fp := filepicker.New()
-	fp.AllowedTypes = []string{} // allow all
-	fp.CurrentDirectory, _ = os.Getwd()
-
 	m := &model{
 		cli:      c,
 		nickname: nick,
-		input:    textinput.New(),
 		viewport: viewport.New(0, 0),
 		state:    "PENDING",
-		fp:       fp,
 	}
 	if c == nil {
 		m.state = "BANNED"
 	}
 
-	m.input.Placeholder = "Type a message... (/help for commands)"
+	ti := textinput.New()
+	ti.Placeholder = "Type a message... (/help for commands)"
+	ti.Focus()
+	ti.CharLimit = 4096
+	ti.Width = 80
+	m.input = ti
 	m.input.PromptStyle = lipgloss.NewStyle().Foreground(clrGreen)
 	m.input.TextStyle = lipgloss.NewStyle().Foreground(clrInput)
-	m.input.Focus()
 	return m
 }
 
@@ -187,15 +181,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, u := range rawUsers {
 				if strings.TrimSpace(u) != "" {
 					parts := strings.SplitN(u, "|", 2)
-					if len(parts) == 2 {
-						shortKey := parts[1]
-						if len(shortKey) > 6 {
-							shortKey = shortKey[:6]
-						}
-						m.onlineUsers = append(m.onlineUsers, parts[0]+" | "+shortKey+"...")
-					} else {
-						m.onlineUsers = append(m.onlineUsers, u)
-					}
+					m.onlineUsers = append(m.onlineUsers, parts[0])
 				}
 			}
 		}
@@ -209,16 +195,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.waitForMsg())
 		return m, tea.Batch(cmds...)
 
-	case uploadDoneMsg:
-		m.isUploading = false
-		if msg.err == nil {
-			chatMsg := protocol.CreateMessage(config.MsgTypeMediaData, msg.filename+"|"+msg.b64data, m.nickname)
-			m.cli.SendChan <- chatMsg
-			m.appendSystem("⬆  Uploading " + msg.filename + "…")
-		} else {
-			m.appendSystem("Upload failed: " + msg.err.Error())
-		}
-		m.refreshViewport()
 
 	case tea.MouseMsg:
 		if !m.showHelp {
@@ -227,27 +203,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
-		if m.showFilePicker {
-			switch msg.String() {
-			case "ctrl+c", "esc":
-				m.showFilePicker = false
-				return m, nil
-			}
-			var cmd tea.Cmd
-			m.fp, cmd = m.fp.Update(msg)
-			if didSelect, path := m.fp.DidSelectFile(msg); didSelect {
-				m.showFilePicker = false
-				m.appendSystem("⏳ Uploading " + path + " to server vault...")
-				go func() {
-					err := m.cli.UploadToServer(path)
-					if err != nil {
-						msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Share failed: "+err.Error(), "SYSTEM")
-						m.cli.UpdateChan <- msg
-					}
-				}()
-			}
-			return m, cmd
-		}
 
 		switch msg.String() {
 		case "ctrl+c":
@@ -300,9 +255,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showHelp = false
 				break
 			}
-			if m.isUploading {
-				break
-			}
 			val := strings.TrimSpace(m.input.Value())
 			if val == "" {
 				break
@@ -311,10 +263,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.handleInput(val))
 
 		case "up", "down", "pgup", "pgdown":
-			if !m.showHelp {
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
-			}
 		}
 
 	case tea.WindowSizeMsg:
@@ -323,7 +271,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Width = msg.Width - 6
 		m.viewport.Width = msg.Width - 2
 		m.viewport.Height = msg.Height - 6
-		m.fp.Height = msg.Height - 6
 		m.refreshViewport()
 	}
 
@@ -348,52 +295,38 @@ func (m *model) handleInput(val string) tea.Cmd {
 		m.appendSystem("🔥 Initiating Panic Switch...")
 		m.refreshViewport()
 		go func() {
-			os.RemoveAll("downloads")
 			os.Remove("identity.key")
 			os.Exit(0)
 		}()
 		return nil
 
-	case strings.HasPrefix(val, "/share") || strings.HasPrefix(val, "/upload") || strings.HasPrefix(val, "/send"):
-		parts := strings.SplitN(val, " ", 2)
-		if len(parts) == 2 {
-			// Direct send
-			path := parts[1]
-			m.appendSystem("⏳ Uploading " + path + " to server vault...")
-			go func() {
-				err := m.cli.UploadToServer(path)
-				if err != nil {
-					msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Upload failed: "+err.Error(), "SYSTEM")
-					m.cli.UpdateChan <- msg
-				}
-			}()
+	case strings.HasPrefix(val, "/private"):
+		parts := strings.SplitN(val, " ", 3)
+		if len(parts) == 3 {
+			target := parts[1]
+			content := parts[2]
+			msg := protocol.CreateMessage(config.MsgTypePrivate, content, m.nickname)
+			msg.ReplyTo = target
+			m.cli.SendChan <- msg
+			// Local echo for sent PM
+			cw := m.width - 2
+			if m.width > 40 { cw -= 20 }
+			m.appendLine(lipgloss.NewStyle().
+				Foreground(clrAdmin).
+				Width(cw - 2).
+				Align(lipgloss.Right).
+				Render("[PM to " + target + "] " + content))
+			m.refreshViewport()
 		} else {
-			// Show picker
-			m.showFilePicker = true
-			m.input.SetValue("")
-			m.fp.Init()
+			m.appendSystem("Usage: /private <nick> <msg>")
+			m.refreshViewport()
 		}
 		return nil
 
-	case strings.HasPrefix(val, "/download"):
-		parts := strings.SplitN(val, " ", 2)
-		if len(parts) == 2 {
-			fileID := parts[1]
-			m.appendSystem("⬇  Requesting " + fileID + "…")
-			m.refreshViewport()
-			go func() {
-				err := m.cli.DownloadSharedFile(fileID, "downloads")
-				if err != nil {
-					// We can't safely call m.appendSystem from another goroutine,
-					// so we send a system message to UpdateChan
-					msg := protocol.CreateMessage(config.MsgTypeSystem, "❌ Download failed: "+err.Error(), "SYSTEM")
-					m.cli.UpdateChan <- msg
-				}
-			}()
-		} else {
-			m.appendSystem("Usage: /download <id>")
-			m.refreshViewport()
-		}
+	case val == "/list":
+		m.appendSystem("Online Users: " + strings.Join(m.onlineUsers, ", "))
+		m.refreshViewport()
+		return nil
 
 	default:
 		// Regular chat message
@@ -434,26 +367,20 @@ func (m *model) refreshViewport() {
 //   - Timestamp                → shown only when msg.IsAdmin == true
 func (m model) renderMessage(msg *protocol.ChatMessage) string {
 	switch msg.Type {
-	case config.MsgTypeSystem, config.MsgTypeJoin, config.MsgTypeFileOffer:
+	case config.MsgTypeSystem, config.MsgTypeJoin:
 		// Minimalist system line — just orange text, no heavy formatting
 		return styleSystem.Render("  · " + msg.Content)
 
-	case config.MsgTypeMediaInfo:
-		return styleSystem.Render("  · " + msg.Content)
-
-	case config.MsgTypeMediaData:
-		// When a download finishes, we get a media data event with the file path
-		sixelStr := TryRenderSixel(msg.Content)
-		if sixelStr != "" {
-			return sixelStr
-		}
-		// If it's not an image or fails, don't show an extra line
-		return ""
-
 	case config.MsgTypePrivate:
-		// Private messages: teal accent
-		pm := lipgloss.NewStyle().Foreground(clrAdmin).Render("[PM] " + msg.Content)
-		return "  " + pm
+		// Private messages: teal accent, right aligned
+		cw := m.width - 2
+		if m.width > 40 { cw -= 20 }
+		pm := lipgloss.NewStyle().
+			Foreground(clrAdmin).
+			Width(cw - 2).
+			Align(lipgloss.Right).
+			Render("[PM] " + msg.Sender + ": " + msg.Content)
+		return pm
 
 	default: // MsgTypeChat and anything else
 		var sb strings.Builder
@@ -494,12 +421,6 @@ func (m model) View() string {
 		return "Connecting…"
 	}
 
-	if m.showFilePicker {
-		header := styleTitleBar.Width(m.width).Render("📂 Select File to Share")
-		body := m.fp.View()
-		footer := styleDim.Render("\n(esc to cancel)")
-		return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-	}
 
 	// ── Overlay: PENDING ──────────────────────────────────────────────────
 	if m.state == "PENDING" {
@@ -637,12 +558,8 @@ func (m model) View() string {
 	var sb strings.Builder
 
 	// Title bar
-	status := ""
-	if m.isUploading {
-		status = lipgloss.NewStyle().Foreground(clrSystem).Render("  ⏳ uploading…")
-	}
 	sb.WriteString(styleTitleBar.Width(m.width - 2).
-		Render(fmt.Sprintf(" CONNER  ·  %s%s", m.nickname, status)))
+		Render(fmt.Sprintf(" CONNER  ·  %s", m.nickname)))
 	sb.WriteString("\n")
 
 	// Split View: Chat (left) | Users (right)
@@ -660,7 +577,9 @@ func (m model) View() string {
 		var userListSB strings.Builder
 		userListSB.WriteString(lipgloss.NewStyle().Bold(true).Underline(true).Render("ONLINE USERS") + "\n")
 		for _, u := range m.onlineUsers {
-			userListSB.WriteString("• " + u + "\n")
+			// Only show nickname (part before first '(' if any, or just clean it)
+			nick := strings.Split(u, " (")[0]
+			userListSB.WriteString("• " + nick + "\n")
 		}
 		userListStr := styleUserList.Width(userListWidth).Height(m.viewport.Height).Render(userListSB.String())
 

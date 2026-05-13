@@ -36,11 +36,8 @@ const (
 	MsgTypePing    = "PING"
 	MsgTypePong    = "PONG"
 	MsgTypeUserList = "USER_LIST"
-	MsgTypeMediaInfo = "MEDIA_INFO"
-	MsgTypeMediaData = "MEDIA_DATA"
 	MsgTypeTyping = "TYPING"
 	MsgTypeKeyShare = "KEY_SHARE"
-	MsgTypeFileOffer = "FILE_OFFER"
 	MsgTypeRoomKey = "ROOM_KEY"
 )
 
