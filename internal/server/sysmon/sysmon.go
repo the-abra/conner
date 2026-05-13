@@ -11,6 +11,14 @@ import (
 	"time"
 )
 
+var (
+	embeddedTorRunning bool
+)
+
+func SetTorStatus(running bool) {
+	embeddedTorRunning = running
+}
+
 // Snapshot holds a point-in-time view of all system metrics.
 type Snapshot struct {
 	CollectedAt time.Time
@@ -176,7 +184,7 @@ func Collect() Snapshot {
 	}
 
 	// Service detection via /proc scan (no pidof/pgrep required)
-	s.TorRunning = procRunning("tor")
+	s.TorRunning = embeddedTorRunning || procRunning("tor")
 	s.NginxRunning = procRunning("nginx")
 
 	return s

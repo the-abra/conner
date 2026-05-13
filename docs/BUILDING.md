@@ -5,25 +5,23 @@
 CONNER is written in Go and requires Go 1.22+.
 
 ### Build Binary
-To build the unified binary:
+To build the unified binary with the embedded Tor motor:
 ```bash
-go build -o conner ./cmd/conner/main.go
+CGO_ENABLED=1 go build -o conner ./cmd/conner/main.go
 ```
 
 ## System Dependencies
 
-The application relies on several external tools for full functionality:
+CONNER is designed for **Zero-Dependency** operation. All critical components are embedded.
 
-| Component | Required For |
-|-----------|--------------|
-| `tor` | All network communication and P2P sharing |
-| `nginx` | Server-side stealth proxying |
-| `iptables` | Server-side network hardening |
-| `coreutils` | Secure file destruction (`shred`) |
-| `img2sixel` | Inline image rendering in TUI |
+| Component | Required For | Status |
+|-----------|--------------|--------|
+| `tor` | Network & P2P | **Embedded** |
+| `coreutils` | Secure deletion (`shred`) | Optional |
+| `img2sixel` | Image rendering | Optional |
 
 ### Auto-Setup
-The binary includes an `autoSetup` feature. When run for the first time as root, it will attempt to detect your package manager (`apk`, `apt`, or `pacman`) and install missing dependencies automatically.
+The binary includes a minimal `autoSetup` feature that checks for optional tools (`shred`, `img2sixel`) and warns if they are missing. It no longer attempts to install packages via system managers, ensuring it can run without root privileges.
 
 ## Automated Pipelines (laction)
 

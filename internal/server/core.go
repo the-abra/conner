@@ -16,15 +16,6 @@ import (
 	"conner/internal/protocol"
 )
 
-// MediaEntry stores metadata about uploaded files
-type MediaEntry struct {
-	ID         string
-	Filename   string
-	Uploader   string
-	UploadedAt time.Time
-	Metadata   string // client address or other info
-}
-
 // EventEntry is a single real-time notification in the dashboard feed.
 type EventEntry struct {
 	Time time.Time
@@ -35,7 +26,6 @@ type EventEntry struct {
 type Server struct {
 	ClientManager  *ClientManager
 	DBManager      *MemoryManager
-	MediaDB        sync.Map // map[string]*MediaEntry
 	Running        bool
 	mu             sync.RWMutex
 	Listener       net.Listener
@@ -179,25 +169,6 @@ func (s *Server) Log(msg string) {
 		s.ConsoleHistory = s.ConsoleHistory[len(s.ConsoleHistory)-1000:]
 	}
 	log.Println(entry)
-}
-
-// GetMediaList returns all media entries as a slice
-func (s *Server) GetMediaList() []*MediaEntry {
-	var entries []*MediaEntry
-	s.MediaDB.Range(func(key, value any) bool {
-		entries = append(entries, value.(*MediaEntry))
-		return true
-	})
-	return entries
-}
-
-// DeleteMedia removes a media entry from RAM
-func (s *Server) DeleteMedia(id string) bool {
-	_, ok := s.MediaDB.Load(id)
-	if ok {
-		s.MediaDB.Delete(id)
-	}
-	return ok
 }
 
 func (s *Server) Start(port string) error {
@@ -527,84 +498,6 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return // LastSeen was already updated in the read pump
 	}
 
-	if msg.Type == config.MsgTypeMediaRegister {
-		parts := strings.SplitN(msg.Content, "|", 3)
-		if len(parts) == 3 {
-			id := parts[1]
-			filename := parts[0]
-			metadata := parts[2]
-
-			entry := &MediaEntry{
-				ID:         id,
-				Filename:   filename,
-				Uploader:   client.Nickname,
-				UploadedAt: time.Now(),
-				Metadata:   metadata,
-			}
-			s.MediaDB.Store(id, entry)
-
-			info := fmt.Sprintf("[FILE] %s shared: %s (ID: %s)", client.Nickname, filename, id)
-			bmsg := protocol.CreateMessage(config.MsgTypeMediaInfo, info, client.Nickname)
-			bmsg.FileId = id
-			s.BroadcastToState(client.State, bmsg, "")
-			s.Log(fmt.Sprintf("[MEDIA] %s registered %s -> %s", client.Nickname, filename, id))
-			s.AddEvent("📎", fmt.Sprintf("%s shared: %s (ID: %s)", client.Nickname, filename, id))
-		}
-		return
-	}
-
-	if msg.Type == config.MsgTypeMediaData {
-		parts := strings.SplitN(msg.Content, "|", 2)
-		if len(parts) >= 2 {
-			// We can now handle broadcasts or targeted relay
-			// If target is provided in content for backwards compatibility,
-			// or we can use a new protocol field.
-			// For now, let's just relay as-is to either everyone or target.
-			
-			// If it's a targeted relay (last part of content if 3 parts)
-			targetedParts := strings.SplitN(msg.Content, "|", 3)
-			if len(targetedParts) == 3 {
-				targetNick := targetedParts[2]
-				target := s.ClientManager.GetClientByNickname(targetNick)
-				if target != nil {
-					s.SendMessage(target, msg)
-					return
-				}
-			}
-
-			// Broadcast to all
-			s.BroadcastToState("WHITELISTED", msg, client.Address)
-		}
-		return
-	}
-
-	if msg.Type == config.MsgTypeDownloadReq {
-		val, ok := s.MediaDB.Load(msg.Content)
-		if ok {
-			entry := val.(*MediaEntry)
-			// Find the owner
-			owner := s.ClientManager.GetClientByNickname(entry.Uploader)
-			if owner != nil {
-				// Request the file from the owner
-				// We send a system message or a special type to the owner
-				// For simplicity, let's reuse MsgTypeDownloadReq but with the file ID
-				req := protocol.CreateMessage(config.MsgTypeDownloadReq, entry.Filename+"|"+msg.Sender, "SERVER")
-				reqBytes, _ := req.Encode()
-				enc, _ := crypto.Encrypt(owner.EncryptionKey, reqBytes)
-				select {
-				case owner.SendChan <- crypto.Base64Encode(enc):
-					s.Log(fmt.Sprintf("[PULL] Requested %s from %s for %s", entry.Filename, owner.Nickname, client.Nickname))
-				default:
-					s.SendSystemMessage(client, "Owner is busy, try again later.")
-				}
-			} else {
-				s.SendSystemMessage(client, "Owner is offline.")
-			}
-		} else {
-			s.SendSystemMessage(client, "File not found or expired.")
-		}
-		return
-	}
 
 	if (msg.Type == config.MsgTypePrivate || msg.Type == config.MsgTypeKeyShare) && msg.IsE2Ee {
 		parts := strings.SplitN(msg.Content, "|", 2)

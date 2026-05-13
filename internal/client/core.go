@@ -1,10 +1,11 @@
 package client
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,13 +18,12 @@ import (
 	"conner/internal/protocol"
 )
 
-const torSOCKS5 = "127.0.0.1:9050"
 
 var ErrBanned = fmt.Errorf("You are banned from this server")
 
 // isTorRunning probes the SOCKS5 port without sending any data.
 func isTorRunning() bool {
-	c, err := net.DialTimeout("tcp", torSOCKS5, 2*time.Second)
+	c, err := net.DialTimeout("tcp", config.TorSocksAddr, 2*time.Second)
 	if err != nil {
 		return false
 	}
@@ -40,17 +40,8 @@ func ensureTorRunning() error {
 		return nil
 	}
 
-	// Try to start tor; best-effort — ignore the error if tor isn't installed
-	// (the connection attempt will fail with a clear message anyway).
-	cmd := exec.Command("tor", "--quiet", "--RunAsDaemon", "1", // #nosec G204
-		"--SocksPort", "9050",
-		"--ControlPort", "9051",
-		"--CookieAuthentication", "1",
-		"--DataDirectory", "/tmp/tor-conner",
-		"--Log", "err file /dev/null")
-	_ = cmd.Start() // detach; don't wait
-
-	// Wait up to 60 s for the port to open (Tor bootstraps slowly).
+	// Tor should have been started by main.go. 
+	// We just wait up to 60s for it to bootstrap.
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(2 * time.Second)
@@ -58,13 +49,14 @@ func ensureTorRunning() error {
 			return nil
 		}
 	}
-	return fmt.Errorf("Tor SOCKS5 port not available after 60s — is Tor installed and running?")
+	return fmt.Errorf("Tor SOCKS5 port (%s) not available after 60s — check if Tor initialized correctly", config.TorSocksAddr)
 }
 
 type OnionInfo struct {
-	Name  string
-	Onion string
-	Token string
+	Name       string
+	Onion      string
+	Token      string
+	FileKeyHex string
 }
 
 type Client struct {
@@ -89,6 +81,8 @@ type Client struct {
 	SenderRatchets     map[string]*crypto.Ratchet // Used to decrypt incoming group messages
 
 	autoSyncOnce       sync.Once
+	sharedWith         map[string]bool // Track who we have shared our ratchet key with
+	IdentityStore      *IdentityStore
 }
 
 func (c *Client) StartAutoSync() {
@@ -110,6 +104,11 @@ func (c *Client) StartAutoSync() {
 					}
 					path := filepath.Join("uploads", f.Name())
 					absPath, _ := filepath.Abs(path)
+
+					// Deduplication check: Do not share if we have it in downloads
+					if _, err := os.Stat(filepath.Join("downloads", f.Name())); err == nil {
+						continue // We downloaded it, don't re-upload
+					}
 
 					// Only upload if we haven't shared this specific path yet
 					c.mu.Lock()
@@ -139,9 +138,20 @@ func loadIdentityKeys() (pub []byte, priv []byte) {
 	if data, err := os.ReadFile(keyFile); err == nil && len(data) == 64 {
 		return data[32:], data[:64]
 	}
-	// Generate new
 	p, s, _ := crypto.GenerateSigningKeyPair()
 	_ = os.WriteFile(keyFile, s, 0600)
+	return p, s
+}
+
+func loadE2EKeys() (pub []byte, priv []byte) {
+	keyFile := "e2e.key"
+	if data, err := os.ReadFile(keyFile); err == nil && len(data) == 64 {
+		return data[32:], data[:64]
+	}
+	s, p, _ := crypto.GenerateKeyPair()
+	// priv then pub
+	combined := append(s, p...)
+	_ = os.WriteFile(keyFile, combined, 0600)
 	return p, s
 }
 
@@ -157,7 +167,7 @@ func Connect(nickname, address string) (*Client, error) {
 		}
 		// Route through Tor — passes domain name directly to the proxy,
 		// ensuring zero local DNS leaks for .onion addresses.
-		dialer, dialErr := proxy.SOCKS5("tcp", torSOCKS5, nil, proxy.Direct)
+		dialer, dialErr := proxy.SOCKS5("tcp", config.TorSocksAddr, nil, proxy.Direct)
 		if dialErr != nil {
 			return nil, fmt.Errorf("failed to create Tor SOCKS5 dialer: %w", dialErr)
 		}
@@ -242,7 +252,7 @@ func Connect(nickname, address string) (*Client, error) {
 		identity = strings.Split(conn.LocalAddr().String(), ":")[0]
 	}
 
-	e2ePriv, e2ePub, _ := crypto.GenerateKeyPair()
+	e2ePub, e2ePriv := loadE2EKeys()
 
 	hello := fmt.Sprintf("CLIENT_HELLO:%s:%s:%s:%s:%s:%s:%s",
 		crypto.Base64Encode(pub),
@@ -284,6 +294,7 @@ func Connect(nickname, address string) (*Client, error) {
 		UserKeys:           make(map[string][]byte),
 		MyRatchet:          crypto.NewRatchet(crypto.GenerateRandomKey()),
 		SenderRatchets:     make(map[string]*crypto.Ratchet),
+		IdentityStore:      NewIdentityStore("identities.json"),
 	}
 
 	go client.readPump()
@@ -292,51 +303,6 @@ func Connect(nickname, address string) (*Client, error) {
 	return client, nil
 }
 
-func (c *Client) RegisterFile(path string) error {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	info, err := os.Stat(absPath)
-	if err != nil {
-		return err
-	}
-	name := info.Name()
-	
-	c.sendUpdate(&protocol.ChatMessage{
-		Type:    config.MsgTypeSystem,
-		Sender:  "SYSTEM",
-		Content: "⏳ Creating Tor Ephemeral Service for " + name + "...",
-	})
-
-	fn, b64, err := CreateMediaTarBase64(absPath)
-	if err != nil {
-		return err
-	}
-	
-	tmpFile := filepath.Join(os.TempDir(), fn+".b64")
-	err = os.WriteFile(tmpFile, []byte(b64), 0644)
-	if err != nil {
-		return err
-	}
-	
-	token := GenerateToken()
-	onion, err := StartEphemeralService(tmpFile, token)
-	if err != nil {
-		return err
-	}
-	
-	content := fmt.Sprintf("%s|%s|%s", name, onion, token)
-	msg := protocol.CreateMessage(config.MsgTypeMediaInfo, content, c.Nickname)
-	c.SendChan <- msg
-	
-	c.sendUpdate(&protocol.ChatMessage{
-		Type:    config.MsgTypeSystem,
-		Sender:  "SYSTEM",
-		Content: "✅ File hosted at " + onion,
-	})
-	return nil
-}
 
 func (c *Client) SendFile(filePath string) error {
 	absPath, err := filepath.Abs(filePath)
@@ -347,22 +313,49 @@ func (c *Client) SendFile(filePath string) error {
 		return fmt.Errorf("file not found: %s", filePath)
 	}
 
+	// Open source file for streaming
+	src, err := os.Open(absPath)
+	if err != nil {
+		return fmt.Errorf("could not open file: %w", err)
+	}
+	defer src.Close()
+
+	// Generate AES Key
+	fileKey := make([]byte, 32)
+	_, _ = rand.Read(fileKey)
+
+	// Create temp encrypted file
+	tmpFile := filepath.Join(os.TempDir(), "enc_"+filepath.Base(absPath))
+	dst, err := os.Create(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	// Stream encryption (No more RAM spikes!)
+	if err := crypto.EncryptStream(fileKey, src, dst); err != nil {
+		dst.Close()
+		return fmt.Errorf("streaming encryption failed: %w", err)
+	}
+	dst.Close()
+
+
 	token := GenerateToken()
-	onion, err := StartEphemeralService(absPath, token)
+	onion, err := StartEphemeralService(tmpFile, token)
 	if err != nil {
 		return fmt.Errorf("P2P service failed: %w", err)
 	}
 
 	// Broadcast offer to the group
 	fileName := filepath.Base(absPath)
-	offerMsg := protocol.CreateMessage(config.MsgTypeFileOffer, fmt.Sprintf("%s|%s|%s", fileName, onion, token), c.Nickname)
+	hexKey := hex.EncodeToString(fileKey)
+	offerMsg := protocol.CreateMessage(config.MsgTypeFileOffer, fmt.Sprintf("%s|%s|%s|%s", fileName, onion, token, hexKey), c.Nickname)
 	offerMsg.IsE2Ee = true
 	c.SendChan <- offerMsg
 
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: fmt.Sprintf("🚀 Hosting %s at %s. Service will close when client exits.", fileName, onion),
+		Content: fmt.Sprintf("🚀 Hosting %s at %s (E2EE Active).", fileName, onion),
 	})
 
 	return nil
@@ -377,21 +370,50 @@ func (c *Client) DownloadSharedFile(id string, destDir string) error {
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: "⏳ Downloading " + info.Name + " from " + info.Onion + "...",
+		Content: "⏳ Downloading " + info.Name + " from " + info.Onion + " [E2EE]...",
 	})
 
 	destPath := filepath.Join(destDir, info.Name)
 	os.MkdirAll(destDir, 0755)
 
-	err := DownloadFile(info.Onion, info.Token, destPath)
+	tmpPath := destPath + ".enc"
+	err := DownloadFile(info.Onion, info.Token, tmpPath)
 	if err != nil {
 		return err
+	}
+
+	// E2EE Decryption
+	if info.FileKeyHex != "" {
+		keyBytes, err := hex.DecodeString(info.FileKeyHex)
+		if err == nil && len(keyBytes) == 32 {
+			encFile, err := os.Open(tmpPath)
+			if err != nil {
+				return err
+			}
+			defer encFile.Close()
+
+			outFile, err := os.Create(destPath)
+			if err != nil {
+				return err
+			}
+			defer outFile.Close()
+
+			if err := crypto.DecryptStream(keyBytes, encFile, outFile); err != nil {
+				return fmt.Errorf("streaming decryption failed: %w", err)
+			}
+			os.Remove(tmpPath)
+		} else {
+			return fmt.Errorf("invalid file key")
+		}
+	} else {
+		// Fallback
+		os.Rename(tmpPath, destPath)
 	}
 
 	c.sendUpdate(&protocol.ChatMessage{
 		Type:    config.MsgTypeSystem,
 		Sender:  "SYSTEM",
-		Content: "✅ Download complete: " + destPath,
+		Content: "✅ Download complete & decrypted: " + destPath,
 	})
 
 	c.sendUpdate(&protocol.ChatMessage{
@@ -447,23 +469,22 @@ func (c *Client) readPump() {
 		}
 
 		if msg.Type == config.MsgTypeKeyShare && msg.IsE2Ee {
-			parts := strings.SplitN(msg.Content, "|", 2)
-			if len(parts) == 2 {
-				// Decrypt the shared Sender Key
-				senderE2E, ok := c.UserKeys[msg.Sender]
-				if ok {
-					shared, _ := crypto.DeriveSharedKey(c.E2EPriv, senderE2E)
-					encBlob, _ := crypto.Base64Decode(parts[1])
-					decKey, err := crypto.Decrypt(shared, encBlob)
-					if err == nil && len(decKey) == 32 {
-						c.SenderRatchets[msg.Sender] = crypto.NewRatchet(decKey)
-					}
+			// Decrypt the shared Sender Key
+			senderE2E, ok := c.UserKeys[msg.Sender]
+			if ok {
+				shared, _ := crypto.DeriveSharedKey(c.E2EPriv, senderE2E)
+				encBlob, _ := crypto.Base64Decode(msg.Content)
+				decKey, err := crypto.Decrypt(shared, encBlob)
+				if err == nil && len(decKey) == 32 {
+					c.SenderRatchets[msg.Sender] = crypto.NewRatchet(decKey)
+					// Reciprocate key share to ensure bilateral sync
+					c.ShareKeyWith(msg.Sender)
 				}
 			}
 			continue
 		}
 
-		if msg.Type == config.MsgTypeChat && msg.Sender != c.Nickname {
+		if (msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypeFileOffer) && msg.Sender != c.Nickname {
 			senderRatchet, ok := c.SenderRatchets[msg.Sender]
 			if ok {
 				msgKey, err := senderRatchet.GetMessageKey(msg.RatchetStep)
@@ -473,13 +494,16 @@ func (c *Client) readPump() {
 					if err == nil {
 						msg.Content = string(decContent)
 					} else {
-						msg.Content = "[E2EE Decryption Failed]"
+						msg.Content = "[E2EE Decryption Failed - Resyncing...]"
+						c.ShareKeyWith(msg.Sender)
 					}
 				} else {
-					msg.Content = "[E2EE Ratchet Desync]"
+					msg.Content = "[E2EE Ratchet Desync - Resyncing...]"
+					c.ShareKeyWith(msg.Sender)
 				}
 			} else {
-				msg.Content = "[E2EE Missing Sender Key]"
+				msg.Content = "[E2EE Syncing...]"
+				c.ShareKeyWith(msg.Sender)
 			}
 		}
 
@@ -488,13 +512,34 @@ func (c *Client) readPump() {
 				parts := strings.SplitN(p, "|", 2)
 				if len(parts) == 2 {
 					nick := parts[0]
-					pub, err := crypto.Base64Decode(parts[1])
+					pubB64 := parts[1]
+					pub, err := crypto.Base64Decode(pubB64)
 					if err == nil && len(pub) == 32 {
+						// TOFU: Trust On First Use Identity Check
+						isOK, isNew := c.IdentityStore.Check(nick, pubB64)
+						if !isOK {
+							c.sendUpdate(&protocol.ChatMessage{
+								Type:    config.MsgTypeSystem,
+								Sender:  "SECURITY",
+								Content: fmt.Sprintf("🚨 WARNING: %s has changed their identity key! (Potential MITM)", nick),
+							})
+							continue 
+						}
+						if isNew && nick != c.Nickname {
+							c.sendUpdate(&protocol.ChatMessage{
+								Type:    config.MsgTypeSystem,
+								Sender:  "SECURITY",
+								Content: fmt.Sprintf("🛡️ New identity discovered: %s (Pinned)", nick),
+							})
+						}
+
+						// If key changed or unknown, share our key to re-establish trust
+						oldKey, exists := c.UserKeys[nick]
 						c.UserKeys[nick] = pub
 						if nick != c.Nickname {
-							// Share our key if we haven't received theirs or shared ours
-							// Actually, let's just share it to be safe, it's idempotent for the UI.
-							c.ShareKeyWith(nick)
+							if !exists || crypto.Base64Encode(oldKey) != pubB64 {
+								c.ShareKeyWith(nick)
+							}
 						}
 					}
 				}
@@ -507,12 +552,20 @@ func (c *Client) readPump() {
 			continue
 		}
 
-		if msg.Type == config.MsgTypeMediaInfo || msg.Type == config.MsgTypeFileOffer {
-			parts := strings.SplitN(msg.Content, "|", 3)
-			if len(parts) == 3 {
+		if msg.Type == config.MsgTypeFileOffer {
+			if msg.Content == "[E2EE Missing Sender Key]" {
+				continue
+			}
+			parts := strings.Split(msg.Content, "|")
+			if len(parts) >= 3 {
 				name := parts[0]
 				onion := parts[1]
 				token := parts[2]
+				
+				fileKeyHex := ""
+				if len(parts) >= 4 {
+					fileKeyHex = parts[3]
+				}
 				
 				c.mu.Lock()
 				if c.AvailableFiles == nil {
@@ -523,17 +576,26 @@ func (c *Client) readPump() {
 					Name: name,
 					Onion: onion,
 					Token: token,
+					FileKeyHex: fileKeyHex,
 				}
 				c.mu.Unlock()
 				
 				c.sendUpdate(&protocol.ChatMessage{
 					Type:    config.MsgTypeSystem,
 					Sender:  "SYSTEM",
-					Content: fmt.Sprintf("📎 %s shared a file: %s (ID: %s) - Type /download %s to get it.", msg.Sender, name, id, id),
+					Content: fmt.Sprintf("📎 %s shared a file: %s (ID: %s) [E2EE]", msg.Sender, name, id),
 				})
 
 				// Auto-Download if not sender
 				if msg.Sender != c.Nickname {
+					// Deduplication check: check if it already exists in uploads/ or downloads/
+					if _, err := os.Stat(filepath.Join("uploads", name)); err == nil {
+						continue // We already have it in uploads
+					}
+					if _, err := os.Stat(filepath.Join("downloads", name)); err == nil {
+						continue // We already have it in downloads
+					}
+
 					go func(fileID string) {
 						time.Sleep(2 * time.Second) // Small delay to let Tor stabilize
 						_ = c.DownloadSharedFile(fileID, "downloads")
@@ -571,7 +633,8 @@ func (c *Client) ShareKeyWith(targetNick string) {
 
 func (c *Client) writePump() {
 	for chatMsg := range c.SendChan {
-		if chatMsg.Type == config.MsgTypeChat {
+		// Only encrypt with ratchet if it's chat/file and NOT a server command
+		if (chatMsg.Type == config.MsgTypeChat || chatMsg.Type == config.MsgTypeFileOffer) && !strings.HasPrefix(chatMsg.Content, "/") {
 			msgKey, step := c.MyRatchet.Next()
 			encContent, _ := crypto.Encrypt(msgKey, []byte(chatMsg.Content))
 			chatMsg.Content = crypto.Base64Encode(encContent)

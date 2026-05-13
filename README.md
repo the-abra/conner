@@ -6,21 +6,23 @@ CONNER is a state-of-the-art secure communication system designed for absolute a
 
 - **True Group E2EE**: Powered by the Double Ratchet (Signal Protocol) and per-client Sender Keys. The server has zero knowledge of chat content.
 - **Decentralized P2P File Sharing**: Files are shared directly between clients via Tor Ephemeral Hidden Services. No central relaying of media.
-- **Tor-Native**: All traffic is routed through the Tor network by default.
+- **Embedded Tor Engine**: No need to install Tor on your system. CONNER manages its own isolated Tor motor.
 - **Anti-Forensics**: 
     - `/burn` panic switch to wipe local identity and data instantly.
     - RAM-only execution support.
     - Sixel image rendering for inline visual feedback without saving to disk.
-- **Stealth Server**: Advanced NGINX reverse proxy setup with no logging and TCP stream isolation.
+- **Zero-Knowledge Blind Relay**: The server only forwards encrypted blobs and manages online identities without storing any metadata or chat logs.
 
 ## Quickstart
 
 ### Prerequisites
-CONNER requires `tor`. If you are running the server, it also needs `nginx` and `iptables`.
+CONNER is designed to be **Zero-Dependency**. It includes an embedded Tor engine. 
+- Optional: `shred` (for secure data wiping), `img2sixel` (for image rendering).
 
 ### Build
+Requires Go 1.18+ and a C compiler (for statically linking the Tor motor).
 ```bash
-CGO_ENABLED=0 go build -o conner ./cmd/conner/main.go
+CGO_ENABLED=1 go build -o conner ./cmd/conner/main.go
 ```
 
 ### Run Client
@@ -30,8 +32,9 @@ CGO_ENABLED=0 go build -o conner ./cmd/conner/main.go
 
 ### Run Server
 ```bash
-sudo ./conner --server --stealth
+./conner --server --stealth
 ```
+> Note: Root (sudo) is NOT required unless you want to use advanced stealth features like RAM-disk mounting or firewall hardening.
 
 ## Commands
 
@@ -91,3 +94,4 @@ dockero remove conner-dev
 - [Architecture Overview](docs/ARCHITECTURE.md)
 - [Building and Deployment](docs/BUILDING.md)
 - [Anonymous Setup Guide](docs/ANONYMOUS_SETUP.md)
+

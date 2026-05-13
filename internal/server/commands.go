@@ -42,7 +42,7 @@ func (r *CommandRegistry) registerDefaults() {
 	r.Register("/private", handlePrivate)
 	r.Register("/ann", handleAnn)
 	r.Register("/op", handleOp)
-	r.Register("/connect", handleConnect)
+	r.Register("/approve", handleApprove)
 	r.Register("/block", handleBlock)
 	r.Register("/blacklist", handleBlock)
 	r.Register("/kick", handleKick)
@@ -100,12 +100,12 @@ func handleOp(s *Server, client *Client, args []string) {
 	}
 }
 
-func handleConnect(s *Server, client *Client, args []string) {
+func handleApprove(s *Server, client *Client, args []string) {
 	if !client.IsAdmin || len(args) == 0 {
 		return
 	}
 	if s.ApproveClient(args[0]) {
-		s.SendSystemMessage(client, args[0]+" moved to Chat Room.")
+		s.SendSystemMessage(client, args[0]+" approved.")
 	} else {
 		s.SendSystemMessage(client, "User not found: "+args[0])
 	}

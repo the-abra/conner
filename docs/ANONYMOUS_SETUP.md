@@ -20,35 +20,19 @@ find /var/log -type f -exec truncate -s 0 {} \;
 ```
 
 ## 3. Application Setup & Network Hardening
-
-### NGINX Reverse Proxy (TCP Stream Mode)
-CONNER communicates via raw TCP sockets. The proxy passes TCP streams without HTTP headers and keeps no logs.
-
-```nginx
-stream {
-    server {
-        listen 80;
-        listen [::]:80;
-        proxy_pass 127.0.0.1:6666;
-    }
-}
-```
-
-### Tor Hidden Service
-The server should only be accessible via Tor to hide its physical location.
-
-```fortran
-# /etc/tor/torrc
-HiddenServiceDir /var/lib/tor/conner_chat/
-HiddenServicePort 80 127.0.0.1:80
-```
+ 
+CONNER is designed for **Zero-Touch Deployment**. 
+- **Internal Tor HS**: The application starts its own Tor motor and generates a `.onion` address automatically. 
+- **No Reverse Proxy**: Direct connection from Tor to the backend port ensures no extra points of failure or logging.
+- **Rootless Operation**: You can run the server as a regular user, which is safer for anonymity (less fingerprinting of the host system).
 
 ## 4. Shielded Execution Environment
 
-CONNER includes a restricted shell (`conner-shell`) to prevent lateral movement if the application is compromised.
+For maximum security, CONNER should be run within a containerized or isolated environment:
 
-1. **Restricted Shell**: Users assigned to `conner-shell` can only run `start-server` and `show-onion`.
-2. **Isolation**: The application runs as a non-root `conner` user with no write access to sensitive system directories.
+1. **Containerization**: Use the provided Dockerfile. It runs the server as a non-privileged user and mounts critical paths as `tmpfs` (RAM-disk).
+2. **Restricted Shell**: If running on bare metal, manually create a restricted shell environment or use `jailkit` to prevent lateral movement if the application is compromised.
+3. **No Persistence**: By default, CONNER stores message history in RAM. A simple restart or power loss wipes all evidence of recent communications.
 
 ## 5. Panic Switch & Data Destruction
 

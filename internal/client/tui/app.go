@@ -186,7 +186,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.onlineUsers = nil
 			for _, u := range rawUsers {
 				if strings.TrimSpace(u) != "" {
-					m.onlineUsers = append(m.onlineUsers, u)
+					parts := strings.SplitN(u, "|", 2)
+					if len(parts) == 2 {
+						shortKey := parts[1]
+						if len(shortKey) > 6 {
+							shortKey = shortKey[:6]
+						}
+						m.onlineUsers = append(m.onlineUsers, parts[0]+" | "+shortKey+"...")
+					} else {
+						m.onlineUsers = append(m.onlineUsers, u)
+					}
 				}
 			}
 		}

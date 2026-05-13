@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,10 +15,17 @@ import (
 	clienttui "conner/internal/client/tui"
 	"conner/internal/config"
 	"conner/internal/server"
+	"conner/internal/server/sysmon"
 	servertui "conner/internal/server/tui"
+	"conner/internal/tor"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"context"
+	"net"
 )
+
+var embeddedTor *tor.EmbeddedTor
+var serverOnion string
 
 func main() {
 	isServer := flag.Bool("server", false, "Run in server mode")
@@ -36,21 +42,58 @@ func main() {
 		fmt.Printf("[!] Auto-setup warning: %v\n", err)
 	}
 
+	if err := startTor(*isServer); err != nil {
+		log.Fatalf("[!] Tor initialization failed: %v", err)
+	}
+
 	if *stealth {
+		if os.Geteuid() != 0 {
+			log.Fatalf("[!] CRITICAL: Stealth mode requires root privileges (sudo).")
+		}
 		if err := enableStealth(*isServer); err != nil {
 			fmt.Printf("[!] Stealth mode activation failed: %v\n", err)
 		}
 	}
 
+	// Port sanity checks
+	var ports []string
 	if *isServer {
+		ports = append(ports, config.ServerPort)
+	} else {
+		ports = append(ports, "8888") // P2P Hosting port
+	}
+	for _, p := range ports {
+		if err := checkPortAvailability(p); err != nil {
+			log.Fatalf("[!] Port Conflict: %v. Please ensure port %s is free.", err, p)
+		}
+	}
+
+	if *isServer {
+		if serverOnion != "" {
+			fmt.Println("\n" + strings.Repeat("=", 60))
+			fmt.Println("  CONNER SERVER IS READY")
+			fmt.Println(strings.Repeat("=", 60))
+			fmt.Printf("  YOUR ONION ADDRESS: %s\n", serverOnion)
+			fmt.Println(strings.Repeat("=", 60))
+			fmt.Println("  (You can copy the address now)")
+			fmt.Print("  Press [ENTER] to launch the Admin Dashboard...")
+			fmt.Scanln()
+		}
 		runServer()
 	} else {
 		runClient()
+	}
+
+	if embeddedTor != nil {
+		embeddedTor.Stop()
 	}
 }
 
 func runServer() {
 	srv := server.NewServer()
+	if serverOnion != "" {
+		srv.Stats.TorAddress = serverOnion
+	}
 
 	startErr := make(chan error, 1)
 	go func() {
@@ -109,252 +152,85 @@ func runClient() {
 	}
 }
 
-func detectPackageManager() string {
-	if _, err := exec.LookPath("apk"); err == nil {
-		return "apk"
-	}
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		return "apt"
-	}
-	if _, err := exec.LookPath("pacman"); err == nil {
-		return "pacman"
-	}
-	return ""
-}
 
 func autoSetup(isServer bool) error {
-	requiredTools := []string{"tor"}
+	optionalTools := []string{}
 	if isServer {
-		requiredTools = append(requiredTools, "nginx", "iptables", "shred")
+		optionalTools = append(optionalTools, "shred")
 	} else {
-		requiredTools = append(requiredTools, "shred", "img2sixel")
+		optionalTools = append(optionalTools, "shred", "img2sixel")
 	}
 
 	var missing []string
-	for _, tool := range requiredTools {
+	for _, tool := range optionalTools {
 		if _, err := exec.LookPath(tool); err != nil {
 			missing = append(missing, tool)
 		}
 	}
 
-	if len(missing) > 0 {
-		pm := detectPackageManager()
-		isRoot := os.Geteuid() == 0
-
-		if !isRoot {
-			fmt.Printf("[!] Missing dependencies: %s\n", strings.Join(missing, ", "))
-			fmt.Println("[!] Please run as root or install them manually.")
-			os.Exit(1)
-		}
-
-		fmt.Printf("[*] Missing dependencies: %s. Attempting to install via %s...\n", strings.Join(missing, ", "), pm)
-
-		pkgMap := map[string]map[string][]string{
-			"apk": {
-				"tor":       {"tor"},
-				"nginx":     {"nginx", "nginx-mod-stream"},
-				"iptables":  {"iptables"},
-				"shred":     {"coreutils"},
-				"img2sixel": {"libsixel-tools"},
-			},
-			"apt": {
-				"tor":       {"tor"},
-				"nginx":     {"nginx", "libnginx-mod-stream"},
-				"iptables":  {"iptables"},
-				"shred":     {"coreutils"},
-				"img2sixel": {"libsixel-bin"},
-			},
-			"pacman": {
-				"tor":       {"tor"},
-				"nginx":     {"nginx"},
-				"iptables":  {"iptables"},
-				"shred":     {"coreutils"},
-				"img2sixel": {"libsixel"},
-			},
-		}
-
-		var pkgsToInstall []string
-		for _, tool := range missing {
-			if p, ok := pkgMap[pm][tool]; ok {
-				pkgsToInstall = append(pkgsToInstall, p...)
-			}
-		}
-
-		if len(pkgsToInstall) > 0 {
-			var err error
-			switch pm {
-			case "apk":
-				runCmd("apk", "update")
-				err = runCmd("apk", append([]string{"add", "--no-cache", "libc6-compat"}, pkgsToInstall...)...)
-			case "apt":
-				runCmd("apt-get", "update")
-				err = runCmd("apt-get", append([]string{"install", "-y"}, pkgsToInstall...)...)
-			case "pacman":
-				err = runCmd("pacman", append([]string{"-Sy", "--noconfirm"}, pkgsToInstall...)...)
-			default:
-				fmt.Printf("[!] Unknown package manager. Please install manually: %s\n", strings.Join(pkgsToInstall, ", "))
-				os.Exit(1)
-			}
-
-			if err != nil {
-				fmt.Printf("[!] Failed to install dependencies: %v\n", err)
-				fmt.Printf("[!] Manual installation required: %s\n", strings.Join(pkgsToInstall, ", "))
-				os.Exit(1)
-			}
-		}
-
-		for _, tool := range missing {
-			if _, err := exec.LookPath(tool); err != nil {
-				fmt.Printf("[!] Tool %s still missing after installation attempt.\n", tool)
-				os.Exit(1)
-			}
-		}
+	for _, tool := range missing {
+		fmt.Printf("[!] Optional tool '%s' is missing. Some features may be limited.\n", tool)
 	}
+
+	return nil
+}
+
+func startTor(isServer bool) error {
+	// Always write the latest local torrc
+	fmt.Println("[*] Configuring Local Tor Instance...")
+	torrc := config.GetTorrcTemplate(isServer)
+	_ = os.WriteFile(config.TorrcPath, []byte(torrc), 0600)
+
+	dir := filepath.Join(config.TorDataDir, "conner_chat")
+	if !isServer {
+		dir = filepath.Join(config.TorDataDir, "conner_client")
+	}
+	_ = os.MkdirAll(dir, 0700)
+
+	// Try system tor first (faster)
+	if _, err := exec.LookPath("tor"); err == nil {
+		fmt.Println("[*] Starting Local Tor process...")
+		_ = exec.Command("pkill", "-f", config.TorrcPath).Run()
+		time.Sleep(500 * time.Millisecond)
+
+		cmd := exec.Command("tor", "-f", config.TorrcPath, "--RunAsDaemon", "1")
+		if err := cmd.Run(); err == nil {
+			if isServer {
+				// Wait for hostname to be generated
+				hostnamePath := filepath.Join(config.TorDataDir, "conner_chat", "hostname")
+				for i := 0; i < 10; i++ {
+					if b, err := os.ReadFile(hostnamePath); err == nil {
+						serverOnion = strings.TrimSpace(string(b))
+						break
+					}
+					time.Sleep(1 * time.Second)
+				}
+			}
+			sysmon.SetTorStatus(true)
+			return nil
+		}
+		fmt.Println("[!] Failed to start system Tor. Falling back to embedded Tor...")
+	}
+
+	fmt.Println("[*] Starting EMBEDDED Tor motor (This might take a few seconds)...")
+	et, err := tor.StartEmbedded(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to start any tor instance: %w", err)
+	}
+	embeddedTor = et
+	config.TorSocksAddr = et.SocksAddr
 
 	if isServer {
-		if _, err := os.Stat("/usr/local/bin/conner-shell"); os.IsNotExist(err) {
-			fmt.Println("[*] Creating restricted shell environment...")
-			shellScript := `#!/bin/sh
-WORKDIR="${CONNER_WORKDIR:-/workspace}"
-cd "$WORKDIR" 2>/dev/null || cd /tmp
-SERVER_BIN="${WORKDIR}/conner"
-if [ -z "$1" ]; then
-    echo "===================================================="
-    echo "       CONNER SHIELDED EXECUTION ENVIRONMENT"
-    echo "===================================================="
-    while true; do
-        printf "conner@shielded:~$ "
-        if ! read -r input; then exit 0; fi
-        case "$input" in
-            "start-server") exec "$SERVER_BIN" --server ;;
-            "show-onion") cat hostname 2>/dev/null || echo "[-] Not generated yet." ;;
-            "exit"|"quit") exit 0 ;;
-            "") continue ;;
-            *) echo "[-] Access Denied." ;;
-        esac
-    done
-else
-    if [ "$1" = "-c" ] && [ "$2" = "start-server" ]; then exec "$SERVER_BIN" --server; fi
-    echo "[-] Access Denied."
-    exit 1
-fi
-`
-			_ = os.WriteFile("/usr/local/bin/conner-shell", []byte(shellScript), 0755)
-			runCmd("sh", "-c", "grep -qxF '/usr/local/bin/conner-shell' /etc/shells || echo '/usr/local/bin/conner-shell' >> /etc/shells")
+		fmt.Println("[*] Generating Ephemeral Hidden Service...")
+		onion, err := et.CreateHiddenService(context.Background(), 6666, 80)
+		if err != nil {
+			return fmt.Errorf("failed to create hidden service: %w", err)
 		}
-
-		runCmd("id", "-u", "conner") 
-		runCmd("adduser", "-D", "-s", "/usr/local/bin/conner-shell", "conner")
-
-		nginxConfPath := "/etc/nginx/nginx.conf"
-		needsUpdate := false
-		if _, err := os.Stat(nginxConfPath); os.IsNotExist(err) {
-			needsUpdate = true
-		} else if b, err := os.ReadFile(nginxConfPath); err == nil {
-			if strings.Contains(string(b), "stream {") && !strings.Contains(string(b), "ngx_stream_module.so") {
-				// Likely missing the module load on Alpine
-				needsUpdate = true
-			}
-		}
-
-		if needsUpdate {
-			fmt.Println("[*] Updating NGINX stealth proxy configuration...")
-			// On Alpine, we must explicitly load the stream module if using nginx-mod-stream
-			var loadModule string
-			if _, err := os.Stat("/usr/lib/nginx/modules/ngx_stream_module.so"); err == nil {
-				loadModule = "load_module /usr/lib/nginx/modules/ngx_stream_module.so;\n"
-			}
-			
-			nginxConf := loadModule + `worker_processes auto;
-error_log /tmp/nginx_error.log info;
-pid /tmp/nginx.pid;
-events { worker_connections 1024; }
-stream {
-    upstream conner_backend {
-        server 127.0.0.1:6666;
-    }
-    server {
-        listen 80;
-        proxy_pass conner_backend;
-        proxy_connect_timeout 10s;
-    }
-}`
-			_ = os.WriteFile("/etc/nginx/nginx.conf", []byte(nginxConf), 0644)
-		}
-
-		if _, err := os.Stat("/etc/tor/torrc"); os.IsNotExist(err) {
-			fmt.Println("[*] Configuring Tor Hidden Service...")
-			torrc := `User tor
-DataDirectory /var/lib/tor
-Log err file /dev/null
-SocksPort 127.0.0.1:9050
-ControlPort 127.0.0.1:9051
-CookieAuthentication 1
-HiddenServiceDir /var/lib/tor/conner_chat/
-HiddenServicePort 80 127.0.0.1:6666
-`
-			_ = os.WriteFile("/etc/tor/torrc", []byte(torrc), 0644)
-			os.MkdirAll("/var/lib/tor/conner_chat", 0700)
-			runCmd("chown", "-R", "tor:tor", "/var/lib/tor")
-			runCmd("chmod", "0755", "/var/lib/tor")
-			runCmd("chmod", "0644", "/var/lib/tor/control_auth_cookie")
-		}
-
-		if _, err := exec.LookPath("rc-service"); err == nil {
-			fmt.Println("[*] Restarting services via rc-service...")
-			runCmd("rc-service", "nginx", "restart")
-			runCmd("rc-service", "tor", "restart")
-		} else {
-			fmt.Println("[*] Restarting services manually...")
-			runCmd("pkill", "-9", "nginx")
-			runCmd("pkill", "-9", "tor")
-			time.Sleep(1 * time.Second)
-			
-			// Start with explicit config paths
-			_ = exec.Command("nginx", "-c", "/etc/nginx/nginx.conf").Start()
-			_ = exec.Command("tor", "-f", "/etc/tor/torrc", "--RunAsDaemon", "1").Start()
-		}
-
-		// Validation loop
-		fmt.Println("[*] Validating proxy chain...")
-		for i := 0; i < 5; i++ {
-			time.Sleep(1 * time.Second)
-			// Check if NGINX is listening on 80
-			conn, err := net.DialTimeout("tcp", "0.0.0.0:80", 500*time.Millisecond)
-			if err == nil {
-				conn.Close()
-				fmt.Println("[+] NGINX is UP and listening on port 80.")
-				break
-			}
-			if i == 4 {
-				fmt.Println("[!] WARNING: NGINX failed to start on port 80. Check /tmp/nginx_error.log")
-			}
-		}
-
-	} else {
-		// Client Setup
-		if _, err := os.Stat("/etc/tor/torrc"); os.IsNotExist(err) {
-			fmt.Println("[*] Configuring Tor (SOCKS5 + P2P Hidden Service)...")
-			torrc := `User tor
-DataDirectory /var/lib/tor
-Log err file /dev/null
-SocksPort 127.0.0.1:9050
-ControlPort 127.0.0.1:9051
-CookieAuthentication 1
-HiddenServiceDir /var/lib/tor/conner_client/
-HiddenServicePort 80 127.0.0.1:8888
-`
-			_ = os.WriteFile("/etc/tor/torrc", []byte(torrc), 0644)
-			os.MkdirAll("/var/lib/tor/conner_client", 0700)
-			runCmd("chown", "-R", "tor:tor", "/var/lib/tor")
-		}
-
-		if _, err := exec.LookPath("rc-service"); err == nil {
-			runCmd("rc-service", "tor", "restart")
-			exec.Command("tor", "--RunAsDaemon", "1").Run()
-		}
+		serverOnion = onion
 	}
 
+	fmt.Println("[+] Tor is UP. Address: " + serverOnion)
+	sysmon.SetTorStatus(true)
 	return nil
 }
 
@@ -403,6 +279,15 @@ func enableStealth(isServer bool) error {
 		_ = exec.Command("shred", "-u", home+"/.sh_history").Run()
 	}
 
+	return nil
+}
+
+func checkPortAvailability(port string) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		return fmt.Errorf("port %s is already in use", port)
+	}
+	_ = ln.Close()
 	return nil
 }
 

@@ -31,4 +31,5 @@ The CONNER server acts as a **dumb relay**:
 - It maintains a list of online users and their associated public identity keys.
 - It forwards encrypted blobs between clients.
 - It cannot decrypt any chat content or file metadata, as all cryptographic keys are managed exclusively at the edges (clients).
-- In `--stealth` mode, it uses NGINX in `stream` mode to isolate the TCP traffic and strip all identifiable headers.
+- **Embedded Relay**: The server manages its own Tor Hidden Service automatically using an embedded Tor motor. No external reverse proxies (like NGINX) are required, ensuring a smaller attack surface.
+- **Port Isolation**: Traffic is passed directly from the Tor Hidden Service to the Go backend, eliminating local TCP proxy hops.

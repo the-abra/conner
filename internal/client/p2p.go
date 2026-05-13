@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"conner/internal/config"
 	"golang.org/x/net/proxy"
 )
 
@@ -49,30 +50,16 @@ func StartEphemeralService(filePath string, token string) (string, error) {
 	}()
 
 	// 2. Connect to Tor Control Port
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:9051", 5*time.Second)
+	conn, err := net.DialTimeout("tcp", config.TorControlAddr, 5*time.Second)
 	if err != nil {
 		return "", fmt.Errorf("could not connect to Tor Control Port: %w", err)
 	}
 	defer conn.Close()
 
 	// 3. Authenticate using Cookie
-	cookiePaths := []string{
-		"/var/lib/tor/control_auth_cookie",
-		"/var/run/tor/control.auth_cookie",
-		"/tmp/tor-conner/control_auth_cookie",
-	}
-	
-	var cookieBytes []byte
-	var cookieErr error
-	for _, p := range cookiePaths {
-		cookieBytes, cookieErr = os.ReadFile(p)
-		if cookieErr == nil {
-			break
-		}
-	}
-	
-	if cookieErr != nil {
-		return "", fmt.Errorf("could not read tor auth cookie: %w", cookieErr)
+	cookieBytes, err := os.ReadFile(config.TorCookiePath)
+	if err != nil {
+		return "", fmt.Errorf("could not read tor auth cookie from %s: %w", config.TorCookiePath, err)
 	}
 	cookieHex := hex.EncodeToString(cookieBytes)
 

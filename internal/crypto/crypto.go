@@ -12,6 +12,44 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
+// EncryptStream encrypts from r to w using AES-CTR for high-performance streaming.
+func EncryptStream(key []byte, r io.Reader, w io.Writer) error {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return err
+	}
+	// Write IV first
+	if _, err := w.Write(iv); err != nil {
+		return err
+	}
+	stream := cipher.NewCTR(block, iv)
+	writer := &cipher.StreamWriter{S: stream, W: w}
+	_, err = io.Copy(writer, r)
+	return err
+}
+
+// DecryptStream decrypts from r to w using AES-CTR for high-performance streaming.
+func DecryptStream(key []byte, r io.Reader, w io.Writer) error {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(r, iv); err != nil {
+		return err
+	}
+	stream := cipher.NewCTR(block, iv)
+	reader := &cipher.StreamReader{S: stream, R: r}
+	_, err = io.Copy(w, reader)
+	return err
+}
+
+
+
 // GenerateKeyPair generates an X25519 keypair
 func GenerateKeyPair() (privateKey []byte, publicKey []byte, err error) {
 	privateKey = make([]byte, curve25519.ScalarSize)

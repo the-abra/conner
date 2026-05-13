@@ -80,11 +80,10 @@ const (
 	tabWhitelist
 	tabBlacklist
 	tabClients
-	tabFiles
 	tabSystem
 )
 
-var tabNames = []string{"Dashboard", "Chat Room", "Blocked", "Clients", "Files", "System"}
+var tabNames = []string{"Dashboard", "Chat Room", "Blocked", "Clients", "System"}
 
 // ─── Model ───────────────────────────────────────────────────────────────────
 
@@ -111,7 +110,7 @@ func tick() tea.Cmd {
 
 func InitialModel(s *server.Server) tea.Model {
 	ti := textinput.New()
-	ti.Placeholder = "/connect <user>  /block <user>  /kick <user>  /ann <msg>"
+	ti.Placeholder = "/approve <user>  /block <user>  /kick <user>  /ann <msg>"
 	ti.PromptStyle = lipgloss.NewStyle().Foreground(clrWhite)
 	ti.TextStyle = lipgloss.NewStyle().Foreground(clrWhite)
 	ti.Focus()
@@ -188,7 +187,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if len(parts) == 1 {
 				// Autocomplete commands
-				cmds := []string{"/ann ", "/kick ", "/block ", "/unblock ", "/whitelist ", "/connect ", "/help", "/op "}
+				cmds := []string{"/ann ", "/kick ", "/block ", "/unblock ", "/whitelist ", "/approve ", "/help", "/op "}
 				for _, c := range cmds {
 					// Match with or without slash
 					if strings.HasPrefix(c, currentWord) || strings.HasPrefix(c, "/"+currentWord) {
@@ -200,7 +199,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmd := parts[0]
 				var users []*server.Client
 				switch cmd {
-				case "/connect", "/approve", "/whitelist":
+				case "/approve", "/whitelist":
 					// Suggest PENDING users
 					for _, c := range m.srv.ClientManager.GetAllClients() {
 						if c.State == "PENDING" {
@@ -252,57 +251,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filesCursor = 0
 			m.viewport.GotoTop()
 
-		case "up", "k":
-			if m.tab == tabFiles {
-				if m.filesCursor > 0 {
-					m.filesCursor--
-					// Ensure viewport follows cursor
-					if m.filesCursor < m.viewport.YOffset {
-						m.viewport.SetYOffset(m.filesCursor)
-					}
-				}
-			} else {
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-
-		case "down", "j":
-			if m.tab == tabFiles {
-				files := m.srv.GetMediaList()
-				if m.filesCursor < len(files)-1 {
-					m.filesCursor++
-					// Ensure viewport follows cursor
-					if m.filesCursor >= m.viewport.YOffset+m.viewport.Height-4 {
-						m.viewport.SetYOffset(m.filesCursor - m.viewport.Height + 5)
-					}
-				}
-			} else {
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-
-		case "pgup", "pgdown":
+		case "up", "k", "down", "j", "pgup", "pgdown":
 			m.viewport, cmd = m.viewport.Update(msg)
 			cmds = append(cmds, cmd)
 
-		case "delete", "d":
-			if m.tab == tabFiles {
-				files := m.srv.GetMediaList()
-				if m.filesCursor < len(files) {
-					entry := files[m.filesCursor]
-					if m.srv.DeleteMedia(entry.ID) {
-						m.statusMsg = fmt.Sprintf("Deleted: %s", entry.Filename)
-						// Clamp cursor: if we deleted the last item,
-						// move up; if list is now empty, reset to 0.
-						remaining := len(files) - 1
-						if remaining <= 0 {
-							m.filesCursor = 0
-						} else if m.filesCursor >= remaining {
-							m.filesCursor = remaining - 1
-						}
-					}
-				}
-			}
 
 		case "enter":
 			if m.showHelp {
@@ -337,12 +289,13 @@ func (m *Model) executeAdminCommand(val string) {
 	cmd := parts[0]
 
 	switch cmd {
-	case "/connect", "/approve":
+	case "/approve":
 		if len(parts) >= 2 {
-			if m.srv.ApproveClient(parts[1]) {
-				m.statusMsg = "✓ Approved: " + parts[1]
+			nick := strings.TrimSpace(parts[1])
+			if m.srv.ApproveClient(nick) {
+				m.statusMsg = "✓ Approved: " + nick
 			} else {
-				m.statusMsg = "User not found: " + parts[1]
+				m.statusMsg = "User not found: " + nick
 			}
 		}
 
@@ -417,7 +370,7 @@ func (m Model) View() string {
 		help := `
   CONNER ADMIN PANEL — Commands
   ─────────────────────────────────────────────
-  /connect <nick>    Approve a pending user
+  /approve <nick>    Approve a pending user
   /block <nick>      Block and disconnect user
   /kick <nick>       Disconnect a user
   /ann <msg>         Send global announcement
@@ -616,77 +569,6 @@ func (m Model) renderTab() string {
 			sb.WriteString(fmt.Sprintf("  %-18s %s %s%s\n", c.Nickname, stateStr, c.Address, admin))
 		}
 		return sb.String()
-	case tabFiles:
-		files := m.srv.GetMediaList()
-
-		// Sort by upload time (newest first)
-		for i := 0; i < len(files)-1; i++ {
-			for j := i + 1; j < len(files); j++ {
-				if files[j].UploadedAt.After(files[i].UploadedAt) {
-					files[i], files[j] = files[j], files[i]
-				}
-			}
-		}
-
-		var sb strings.Builder
-
-		if len(files) == 0 {
-			sb.WriteString(styleTitle.Render(" FILES ") + "\n\n")
-			sb.WriteString(lipgloss.NewStyle().Foreground(clrGray).Italic(true).Render(
-				"  No files uploaded yet.\n"+
-					"  Files uploaded by clients are stored in RAM\n"+
-					"  and appear here for download or deletion.",
-			) + "\n")
-			return sb.String()
-		}
-
-		sb.WriteString(styleTitle.Render(fmt.Sprintf(" FILES (%d) AVAILABLE ", len(files))) + "\n")
-
-		// ── Column headers ───────────────────────────────────────────────────
-		colID := 12
-		colName := 30
-		colUp := 16
-		colSize := 10
-		colAge := 10
-
-		headers := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %-*s",
-			colID, "FILE ID",
-			colName, "FILENAME",
-			colUp, "UPLOADER",
-			colSize, "SIZE",
-			colAge, "AGE",
-		)
-		sb.WriteString(lipgloss.NewStyle().Foreground(clrDkWhite).Bold(true).Render(headers) + "\n")
-		sb.WriteString(styleGray("  "+strings.Repeat("─", m.width-6)) + "\n")
-
-		// ── File rows ─────────────────────────────────────────────────────────
-		for i, f := range files {
-			sz := "REMOTE"
-			if f.Metadata != "" {
-				sz = f.Metadata
-			}
-			age := fileAge(f.UploadedAt)
-
-			row := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %-*s",
-				colID, f.ID,
-				colName, truncate(f.Filename, colName),
-				colUp, truncate(f.Uploader, colUp),
-				colSize, sz,
-				colAge, age,
-			)
-
-			style := lipgloss.NewStyle()
-			if i == m.filesCursor {
-				style = style.Background(clrDkWhite).Foreground(lipgloss.Color("#000000")).Bold(true)
-			} else if i%2 == 1 {
-				style = style.Foreground(lipgloss.Color("#AAAAAA"))
-			} else {
-				style = style.Foreground(clrWhite)
-			}
-
-			sb.WriteString(style.Render(row) + "\n")
-		}
-		return sb.String()
 
 	case tabSystem:
 		snap := m.sysSnap
@@ -783,12 +665,7 @@ func (m Model) renderTab() string {
 		if snap.TorRunning {
 			torStatus = lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")
 		}
-		nginxStatus := lipgloss.NewStyle().Foreground(clrRed).Render("● STOPPED")
-		if snap.NginxRunning {
-			nginxStatus = lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")
-		}
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Tor:", torStatus))
-		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "NGINX:", nginxStatus))
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Conner Server:", lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")))
 		sb.WriteString("\n")
 		sb.WriteString(styleGray(fmt.Sprintf("  Last updated: %s\n", snap.CollectedAt.Format("15:04:05"))))
