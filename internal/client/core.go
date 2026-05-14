@@ -1,11 +1,19 @@
 package client
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +23,7 @@ import (
 	"conner/internal/config"
 	"conner/internal/crypto"
 	"conner/internal/protocol"
+	"conner/internal/tor"
 )
 
 
@@ -57,7 +66,8 @@ type Client struct {
 	Nickname           string
 	Messages           []string
 	SendChan           chan *protocol.ChatMessage
-	mu                 sync.Mutex
+	p2p                *P2PService // P2P Service for Tor mode
+	mu                 sync.RWMutex
 	UpdateChan         chan *protocol.ChatMessage // typed messages for rich TUI rendering
 	// Security items
 	SigningPriv        []byte                    // Ed25519 Private Key for identity
@@ -67,7 +77,14 @@ type Client struct {
 	RoomKey            []byte      // Centralized AES key (Content)
 	VaultToken         string      // Server access token (Auth)
 	ServerOnion        string      // Onion address of the hub
+	ServerHTTPPort     int         // Port for Direct mode file transfers
 	UseTor             bool
+	SocksAddr          string
+	syncLedger         map[string]time.Time      // filename -> last sync time
+	activeDownloads    map[string]bool           // filename -> currently downloading
+	Ctx                context.Context
+	Cancel             context.CancelFunc
+	autoSyncOnce       sync.Once
 }
 
 
@@ -81,7 +98,7 @@ func loadIdentityKeys(nick string) (pub []byte, priv []byte) {
 	return p, s
 }
 
-func Connect(nickname, address string, useTor bool) (*Client, error) {
+func Connect(nickname, address string, useTor bool, et *tor.EmbeddedTor) (*Client, error) {
 	var conn net.Conn
 	var err error
 
@@ -197,6 +214,12 @@ func Connect(nickname, address string, useTor bool) (*Client, error) {
 		return nil, fmt.Errorf("handshake: expected HANDSHAKE_OK, got: %s", respLine)
 	}
 
+	var srvHTTPPort int
+	partsOK := strings.Split(respLine, "|")
+	if len(partsOK) >= 2 {
+		fmt.Sscanf(partsOK[1], "%d", &srvHTTPPort)
+	}
+
 	// 1. Initialize P2P Service once
 	client := &Client{
 		Conn:               conn,
@@ -210,7 +233,18 @@ func Connect(nickname, address string, useTor bool) (*Client, error) {
 		UserKeys:           make(map[string][]byte),
 		IdentityStore:      NewIdentityStore(fmt.Sprintf("identities_%s.json", nickname)),
 		ServerOnion:        strings.Split(address, ":")[0],
+		ServerHTTPPort:     srvHTTPPort,
 		UseTor:             useTor,
+		SocksAddr:          config.TorSocksAddr,
+		syncLedger:         make(map[string]time.Time),
+		activeDownloads:    make(map[string]bool),
+	}
+	client.Ctx, client.Cancel = context.WithCancel(context.Background())
+
+	if et != nil {
+		p2p, _ := StartP2PService(et)
+		client.p2p = p2p
+		client.SocksAddr = et.SocksAddr
 	}
 
 	go client.readPump()
@@ -220,21 +254,17 @@ func Connect(nickname, address string, useTor bool) (*Client, error) {
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			c := client // use local closure
-			c.mu.Lock()
-			conn := c.Conn
-			c.mu.Unlock()
-
-			if conn == nil {
+		for {
+			select {
+			case <-client.Ctx.Done():
 				return
+			case <-ticker.C:
+				ping := &protocol.ChatMessage{
+					Type:   config.MsgTypePing,
+					Sender: client.Nickname,
+				}
+				client.SendChan <- ping
 			}
-
-			ping := &protocol.ChatMessage{
-				Type:   config.MsgTypePing,
-				Sender: c.Nickname,
-			}
-			c.SendChan <- ping
 		}
 	}()
 
@@ -249,6 +279,8 @@ func (c *Client) readPump() {
 			Sender:  "SERVER",
 			Content: "❌ Connection closed by server.",
 		})
+		// 6. Final cleanup on close
+		c.Cancel()
 	}()
 
 	for {
@@ -294,20 +326,30 @@ func (c *Client) readPump() {
 				hash := hex.EncodeToString(h.Sum(nil))
 
 				c.mu.Lock()
+				crypto.Wipe(c.RoomKey)
 				c.RoomKey = key
 				c.VaultToken = hash
+				if c.p2p != nil {
+					c.p2p.UpdateToken(key)
+				}
 				c.mu.Unlock()
-				c.sendUpdate(&protocol.ChatMessage{
-					Type:    config.MsgTypeSystem,
-					Sender:  "SECURITY",
-					Content: "🔐 New Room Key synced. Access Token rotated.",
-				})
 			}
 			continue
 		}
+		// Security Check: Engine Compatibility
+		if msg.Type == config.MsgTypeJoin {
+			peerVersion := msg.FileId // We'll hijack FileId for version during Join
+			if peerVersion != "" && peerVersion != config.Version {
+				c.sendUpdate(&protocol.ChatMessage{
+					Type:    config.MsgTypeSystem,
+					Sender:  "SECURITY",
+					Content: fmt.Sprintf("⚠️ WARNING: Peer %s is using a different version (%s). Sync might be unstable.", msg.Sender, peerVersion),
+				})
+			}
+		}
 
-		// Decrypt Group Messages (Chat)
-		if (msg.Type == config.MsgTypeChat) && msg.Sender != c.Nickname {
+		// Decrypt Group Messages (Chat / FileOffer)
+		if (msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypeFileOffer) && msg.Sender != c.Nickname {
 			c.mu.Lock()
 			rk := c.RoomKey
 			c.mu.Unlock()
@@ -322,6 +364,64 @@ func (c *Client) readPump() {
 				}
 			}
 		}
+
+		if msg.Type == config.MsgTypeFileOffer {
+			parts := strings.Split(msg.Content, "|")
+			if len(parts) >= 3 {
+				filename := parts[0]
+				senderOnion := parts[1]
+				fileID := parts[2]
+				
+				// CHECK: Already synced OR currently downloading OR is our own file
+				if c.isSeen(filename) || c.isDownloading(filename) || msg.Sender == c.Nickname {
+					continue
+				}
+
+				c.sendUpdate(&protocol.ChatMessage{
+					Type:    config.MsgTypeSystem,
+					Sender:  "SYNC",
+					Content: "📥 Auto-sync triggered for: " + filename + " (Source: " + msg.Sender + ")",
+				})
+
+				checksum := ""
+				if len(parts) >= 4 {
+					checksum = parts[3]
+				}
+				
+				// Mark as active to prevent duplicate triggers
+				c.setDownloading(filename, true)
+
+				go func(f, addr, id, expectedSum string) {
+					defer func() {
+						c.setDownloading(f, false)
+					}()
+
+					var err error
+					if id == "VAULT" {
+						err = c.DownloadSharedFile(f, addr, "downloads")
+					} else {
+						err = c.DownloadP2PFile(f, addr, id, "downloads")
+					}
+					
+					if err == nil && expectedSum != "" {
+						actual, _ := calculateSHA256(filepath.Join("downloads", f))
+						if actual != expectedSum {
+							os.Remove(filepath.Join("downloads", f))
+							err = fmt.Errorf("checksum mismatch: security breach suspected")
+						}
+					}
+						
+					if err != nil {
+						c.sendUpdate(&protocol.ChatMessage{
+							Type:    config.MsgTypeSystem,
+							Sender:  "SYNC",
+							Content: "❌ Auto-download failed: " + f + " (" + err.Error() + ")",
+						})
+					}
+				}(filename, senderOnion, fileID, checksum)
+				}
+				continue
+			}
 
 		if msg.Type == config.MsgTypeUserList {
 			for _, p := range strings.Split(msg.Content, ",") {
@@ -365,6 +465,498 @@ func (c *Client) readPump() {
 	}
 }
 
+// Atomic Map Helpers
+func (c *Client) isSynced(filename string, modTime time.Time) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	lastSync, seen := c.syncLedger[filename]
+	if !seen { return false }
+	return !modTime.After(lastSync)
+}
+
+func (c *Client) isSeen(filename string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, seen := c.syncLedger[filename]
+	return seen
+}
+
+func (c *Client) markSynced(filename string, modTime time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.syncLedger[filename] = modTime
+}
+
+func (c *Client) setDownloading(filename string, active bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if active {
+		c.activeDownloads[filename] = true
+	} else {
+		delete(c.activeDownloads, filename)
+	}
+}
+
+func (c *Client) isDownloading(filename string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.activeDownloads[filename]
+}
+
+func (c *Client) StartAutoSync() {
+	c.autoSyncOnce.Do(func() {
+		os.MkdirAll("uploads", 0755)
+		os.MkdirAll("downloads", 0755)
+		
+		tempDir := filepath.Join(".conner_data", "temp_shares")
+		os.RemoveAll(tempDir)
+		os.MkdirAll(tempDir, 0700)
+
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-c.Ctx.Done():
+					return
+				case <-ticker.C:
+					files, err := os.ReadDir("uploads")
+					if err != nil {
+						continue
+					}
+
+					for _, file := range files {
+						name := file.Name()
+						info, err := file.Info()
+						if err != nil {
+							continue
+						}
+
+						if c.isDownloading(name) || c.isSynced(name, info.ModTime()) {
+							continue
+						}
+
+						c.markSynced(name, info.ModTime())
+
+						c.sendUpdate(&protocol.ChatMessage{
+							Type:    config.MsgTypeSystem,
+							Sender:  "SYNC",
+							Content: "📤 Auto-uploading: " + name,
+						})
+						
+						go func(path string) {
+							var err error
+							if c.UseTor && c.p2p != nil && c.p2p.GetOnionAddr() != "" {
+								// Tor Mode: P2P Share
+								targetPath := path
+								displayPath := filepath.Base(path)
+								if info.IsDir() {
+									tempDir := filepath.Join(".conner_data", "temp_shares")
+									zipPath := filepath.Join(tempDir, displayPath+".zip")
+									if err := CreateZip(path, zipPath); err != nil {
+										c.sendUpdate(&protocol.ChatMessage{Type: config.MsgTypeSystem, Sender: "SYNC", Content: "❌ Zip failed: " + err.Error()})
+										return
+									}
+									targetPath = zipPath
+									displayPath = displayPath + ".zip"
+									// Do NOT remove yet - it needs to be served to peers
+								}
+
+								fileID := fmt.Sprintf("SYNC_%d_%s", time.Now().Unix(), c.Nickname)
+								c.p2p.AddFile(fileID, targetPath)
+								checksum, _ := calculateSHA256(targetPath)
+								metadata := fmt.Sprintf("%s|%s|%s|%s", displayPath, c.p2p.GetOnionAddr(), fileID, checksum)
+								shareMsg := protocol.CreateMessage(config.MsgTypeFileOffer, metadata, c.Nickname)
+								c.SendChan <- shareMsg
+								
+								c.sendUpdate(&protocol.ChatMessage{
+									Type:    config.MsgTypeSystem,
+									Sender:  "P2P",
+									Content: "📡 P2P Share Active: " + displayPath + " (ID: " + fileID + ")",
+								})
+							} else {
+								// Direct Mode: Upload to Server Vault
+								err = c.UploadToServer(path)
+								if err == nil {
+									c.sendUpdate(&protocol.ChatMessage{
+										Type:    config.MsgTypeSystem,
+										Sender:  "SYNC",
+										Content: "✅ Uploaded to Vault: " + filepath.Base(path),
+									})
+									// Announce to everyone
+									metadata := fmt.Sprintf("%s|%s|VAULT", filepath.Base(path), c.ServerOnion)
+									c.SendChan <- protocol.CreateMessage(config.MsgTypeFileOffer, metadata, c.Nickname)
+								}
+							}
+
+							if err != nil {
+								c.sendUpdate(&protocol.ChatMessage{
+									Type:    config.MsgTypeSystem,
+									Sender:  "SYNC",
+									Content: "❌ Sync failed: " + filepath.Base(path) + " - " + err.Error(),
+								})
+							}
+						}(filepath.Join("uploads", name))
+					}
+				}
+			}
+		}()
+	})
+}
+
+func (c *Client) UploadToServer(localPath string) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+
+	if info.Size() > 100*1024*1024 {
+		return fmt.Errorf("file too large for auto-sync (>100MB)")
+	}
+
+	targetFile := localPath
+	isDir := info.IsDir()
+	if isDir {
+		zipPath := localPath + ".zip"
+		if err := CreateZip(localPath, zipPath); err != nil {
+			return err
+		}
+		targetFile = zipPath
+		defer os.Remove(zipPath)
+	}
+
+	file, err := os.Open(targetFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", filepath.Base(targetFile))
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(part, file)
+	writer.Close()
+
+	c.mu.Lock()
+	token := c.VaultToken
+	c.mu.Unlock()
+
+	url := fmt.Sprintf("http://%s/upload?u=%s&t=%s", c.ServerOnion, c.Nickname, token)
+	if c.UseTor {
+		url = fmt.Sprintf("http://%s:80/upload?u=%s&t=%s", c.ServerOnion, c.Nickname, token)
+	} else if !strings.Contains(c.ServerOnion, ":") {
+		if c.ServerHTTPPort > 0 {
+			url = fmt.Sprintf("http://%s:%d/upload?u=%s&t=%s", c.ServerOnion, c.ServerHTTPPort, c.Nickname, token)
+		} else {
+			url = fmt.Sprintf("http://%s:6666/upload?u=%s&t=%s", c.ServerOnion, c.Nickname, token)
+		}
+	}
+
+	req, _ := http.NewRequest("POST", url, body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	var client *http.Client
+	if c.UseTor {
+		dialer, _ := proxy.SOCKS5("tcp", c.SocksAddr, nil, proxy.Direct)
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+		}
+		client = &http.Client{Transport: transport, Timeout: 10 * time.Minute}
+	} else {
+		client = &http.Client{Timeout: 10 * time.Minute}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server error: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (c *Client) DownloadP2PFile(filename, senderOnion, fileID, destDir string) error {
+	filename = filepath.Base(filename)
+	c.mu.Lock()
+	c.activeDownloads[filename] = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.activeDownloads, filename)
+		c.mu.Unlock()
+	}()
+
+	os.MkdirAll(destDir, 0755)
+	
+	// Hash Handshake: Get current RoomKey hash
+	c.mu.RLock()
+	rk := c.RoomKey
+	c.mu.RUnlock()
+	
+	h := sha256.New()
+	h.Write(rk)
+	myHash := hex.EncodeToString(h.Sum(nil))
+
+	// Construct URL: http://onion:80/p2p_download?id=...
+	urlStr := fmt.Sprintf("http://%s/p2p_download?id=%s", senderOnion, fileID)
+	if !strings.Contains(senderOnion, ":") {
+		urlStr = fmt.Sprintf("http://%s:80/p2p_download?id=%s", senderOnion, fileID)
+	}
+
+	var proxyURL *url.URL
+	if c.UseTor {
+		proxyURL, _ = url.Parse("socks5://" + c.SocksAddr)
+	}
+
+	client := &http.Client{
+		Timeout: 60 * time.Minute,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			DialContext: (&net.Dialer{
+				Timeout:   60 * time.Second,
+				KeepAlive: 60 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout: 60 * time.Second,
+		},
+	}
+
+	req, _ := http.NewRequest("GET", urlStr, nil)
+	req.Header.Set("Authorization", "Bearer "+myHash)
+
+	var resp *http.Response
+	var err error
+	for i := 0; i < 12; i++ {
+		resp, err = client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil { resp.Body.Close() }
+		time.Sleep(5 * time.Second)
+	}
+
+	if err != nil {
+		return fmt.Errorf("P2P download failed after retries: %w", err)
+	}
+	defer resp.Body.Close()
+
+	destPath := filepath.Join(destDir, filename)
+	out, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	out.Close() // Close before extraction
+	if err != nil {
+		return err
+	}
+
+	// Update ledger so we don't re-upload what we just downloaded
+	c.markSynced(filename, time.Now())
+
+	// Auto-extract if it was a directory (zip)
+	if strings.HasSuffix(filename, ".zip") {
+		extractPath := filepath.Join(destDir, strings.TrimSuffix(filename, ".zip"))
+		os.MkdirAll(extractPath, 0755)
+		if err := ExtractZip(destPath, extractPath); err == nil {
+			os.Remove(destPath)
+		}
+	}
+
+	c.sendUpdate(&protocol.ChatMessage{
+		Type:    config.MsgTypeSystem,
+		Sender:  "P2P",
+		Content: "✅ P2P Download Complete: " + filename,
+	})
+
+	return nil
+}
+
+func (c *Client) DownloadSharedFile(filename, serverAddr, destDir string) error {
+	filename = filepath.Base(filename)
+	c.setDownloading(filename, true)
+	defer c.setDownloading(filename, false)
+
+	os.MkdirAll(destDir, 0755)
+	c.mu.RLock()
+	token := c.VaultToken
+	c.mu.RUnlock()
+
+	url := fmt.Sprintf("http://%s/download?f=%s&t=%s", serverAddr, filename, token)
+	// If it's an onion address and no port is specified, use 80
+	if strings.HasSuffix(serverAddr, ".onion") && !strings.Contains(serverAddr, ":") {
+		url = fmt.Sprintf("http://%s:80/download?f=%s&t=%s", serverAddr, filename, token)
+	} else if !strings.Contains(serverAddr, ":") {
+		// Use the learned ServerHTTPPort for Direct Mode
+		if c.ServerHTTPPort > 0 {
+			url = fmt.Sprintf("http://%s:%d/download?f=%s&t=%s", serverAddr, c.ServerHTTPPort, filename, token)
+		} else {
+			url = fmt.Sprintf("http://%s:6666/download?f=%s&t=%s", serverAddr, filename, token)
+		}
+	}
+
+	var client *http.Client
+	if c.UseTor {
+		dialer, _ := proxy.SOCKS5("tcp", c.SocksAddr, nil, proxy.Direct)
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+		}
+		client = &http.Client{Transport: transport, Timeout: 10 * time.Minute}
+	} else {
+		client = &http.Client{Timeout: 10 * time.Minute}
+	}
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	var resp *http.Response
+	var err error
+	for i := 0; i < 3; i++ {
+		resp, err = client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil { resp.Body.Close() }
+		time.Sleep(2 * time.Second) // Wait before retry
+	}
+
+	if err != nil {
+		return fmt.Errorf("download failed after 3 attempts: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server error: %d", resp.StatusCode)
+	}
+
+	destPath := filepath.Join(destDir, filename)
+	out, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local file: %w", err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	// Update ledger so we don't re-upload what we just downloaded
+	info, _ := os.Stat(destPath)
+	c.markSynced(filename, info.ModTime())
+
+	// If it was a zip, extract it
+	if strings.HasSuffix(filename, ".zip") {
+		extractPath := filepath.Join(destDir, strings.TrimSuffix(filename, ".zip"))
+		os.MkdirAll(extractPath, 0755)
+		if err := ExtractZip(destPath, extractPath); err == nil {
+			os.Remove(destPath)
+		} else {
+			return fmt.Errorf("failed to extract zip: %w", err)
+		}
+	}
+
+	c.sendUpdate(&protocol.ChatMessage{
+		Type:    config.MsgTypeSystem,
+		Sender:  "SYNC",
+		Content: "✅ Auto-download complete: " + filename,
+	})
+
+	return nil
+}
+
+func CreateZip(src, dst string) error {
+	zipFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer zipFile.Close()
+
+	zw := zip.NewWriter(zipFile)
+	defer zw.Close()
+
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name, _ = filepath.Rel(filepath.Dir(src), path)
+		if info.IsDir() {
+			header.Name += "/"
+		} else {
+			header.Method = zip.Deflate
+		}
+		writer, err := zw.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		_, err = io.Copy(writer, file)
+		return err
+	})
+}
+
+func ExtractZip(src, dest string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		fpath := filepath.Join(dest, f.Name)
+		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path: %s", fpath)
+		}
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
+		if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // sendUpdate sends to UpdateChan without blocking — drops if channel is full.
 func (c *Client) sendUpdate(msg *protocol.ChatMessage) {
 	select {
@@ -377,7 +969,7 @@ func (c *Client) sendUpdate(msg *protocol.ChatMessage) {
 func (c *Client) writePump() {
 	for chatMsg := range c.SendChan {
 		// Encrypt with RoomKey if it's a chat message
-		if chatMsg.Type == config.MsgTypeChat {
+		if chatMsg.Type == config.MsgTypeChat || chatMsg.Type == config.MsgTypeFileOffer {
 			c.mu.Lock()
 			rk := c.RoomKey
 			c.mu.Unlock()
@@ -392,6 +984,18 @@ func (c *Client) writePump() {
 		enc, _ := crypto.Encrypt(c.SessionKey, jsonBytes)
 		protocol.SendFrame(c.Conn, []byte(crypto.Base64Encode(enc)))
 	}
+}
+func calculateSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 

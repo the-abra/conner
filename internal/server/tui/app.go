@@ -2,6 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -353,6 +356,38 @@ func (m *Model) executeAdminCommand(val string) {
 		m.srv.Log("Admin purged all persistent data")
 		m.statusMsg = "🗑 Database purged"
 
+	case "/burn":
+		m.statusMsg = "🔥 CRITICAL: Initiating Secure Total Wipe..."
+		go func() {
+			// Kill any local tor processes we started
+			exec.Command("pkill", "-9", "tor").Run()
+			time.Sleep(500 * time.Millisecond)
+
+			sensitiveDirs := []string{"vault", ".conner_data", "uploads", "downloads"}
+			
+			// Try to shred individual files in these directories first
+			for _, d := range sensitiveDirs {
+				_ = filepath.Walk(d, func(path string, info os.FileInfo, err error) error {
+					if err == nil && !info.IsDir() {
+						_ = exec.Command("shred", "-u", "-n", "3", path).Run()
+					}
+					return nil
+				})
+				_ = os.RemoveAll(d)
+			}
+
+			// Remove any identity stores and keys in current dir
+			files, _ := os.ReadDir(".")
+			for _, f := range files {
+				name := f.Name()
+				if strings.HasPrefix(name, "identities_") || strings.HasPrefix(name, "identity_") || strings.HasSuffix(name, ".key") {
+					_ = exec.Command("shred", "-u", "-n", "3", name).Run()
+					_ = os.Remove(name)
+				}
+			}
+			os.Exit(0)
+		}()
+
 	default:
 		m.statusMsg = "Unknown command: " + cmd
 		m.srv.Log("Admin unknown command: " + val)
@@ -376,6 +411,7 @@ func (m Model) View() string {
   /ann <msg>         Send global announcement
   /op <nick>         Grant admin permissions
   /purge             Clear all chat history
+  /burn              EMERGENCY SELF-DESTRUCT (Aggressive)
   /help              Show this menu
   
   [Tab]              Auto-complete commands/users
@@ -429,10 +465,6 @@ func (m Model) View() string {
 	// ── Input ────────────────────────────────────────────────────────────────
 	sb.WriteString(styleInput.Render(m.input.View()) + "\n")
 
-	// ── Help Footer ──────────────────────────────────────────────────────────
-	help := styleGray("  [Tab] autocomplete / switch   [S-Tab] prev tab   [Shift+Mouse] select & copy")
-	sb.WriteString(help)
-
 	return sb.String()
 }
 
@@ -467,6 +499,7 @@ func (m Model) renderTab() string {
 			return fmt.Sprintf("  %-18s %s\n", label, lipgloss.NewStyle().Foreground(clrWhite).Render(val))
 		}
 		left.WriteString(stat("Tor Address:", truncate(m.srv.Stats.TorAddress, colW-22)))
+		left.WriteString(stat("Vault (HTTP):", fmt.Sprintf("Port %d", m.srv.HTTPPort)))
 		left.WriteString(stat("Uptime:", uptime.String()))
 		left.WriteString(stat("Total Connections:", fmt.Sprintf("%d", m.srv.Stats.TotalConnections)))
 		left.WriteString(stat("Messages Sent:", fmt.Sprintf("%d", m.srv.Stats.MessagesSent)))

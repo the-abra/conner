@@ -15,14 +15,17 @@ const (
 	// Limits
 	MaxClients         = 100
 	MessageSizeLimit   = 8192
-	MessageHistoryLimit = 100
+	MessageHistoryLimit = 1000
 
 	// Security
 	RateLimitWindow   = 1.0 * time.Second
-	RateLimitMessages = 5
+	RateLimitMessages = 20
 
 	// Application limits
 	MessageTTL = 24 * time.Hour
+	
+	// Engine Version
+	Version = "v2.1-AUDITED"
 )
 
 // Message types
@@ -41,11 +44,7 @@ const (
 	MsgTypeRoomKey = "ROOM_KEY"
 	MsgTypeAck     = "ACK"
 	MsgTypeReaction = "REACTION"
-	MsgTypeShare    = "SHARE"
-	MsgTypeGetFileMetadata = "GET_FILE_METADATA"
-	MsgTypeFileUpload = "FILE_UPLOAD"
-	MsgTypeFileDownloadReq = "FILE_DOWNLOAD_REQ"
-	MsgTypeFileDownloadRes = "FILE_DOWNLOAD_RES"
+	MsgTypeFileOffer       = "FILE_OFFER"
 )
 
 // Tor Config
@@ -70,23 +69,27 @@ func init() {
 	_ = os.MkdirAll(TorDataDir, 0700)
 }
 
-func GetTorrcTemplate(isServer bool) string {
-	port := "8888" // Client P2P port
+func GetTorrcTemplate(isServer bool, chatPort, httpPort string) string {
 	dir := "conner_client"
 	if isServer {
-		port = "6666" // Server port
 		dir = "conner_chat"
 	}
 
-	// Note: We removed "User tor" to allow running as a non-privileged user.
-	// We also use local absolute paths.
-	return fmt.Sprintf(`DataDirectory %s
+	template := fmt.Sprintf(`DataDirectory %s
 Log err file /dev/null
 SocksPort %s
 ControlPort %s
 CookieAuthentication 1
-HiddenServiceDir %s/%s/
-HiddenServicePort 80 127.0.0.1:%s
-`, TorDataDir, TorSocksAddr, TorControlAddr, TorDataDir, dir, port)
+HiddenServiceDir %s/tor/%s/
+`, TorDataDir, TorSocksAddr, TorControlAddr, TorDataDir, dir)
+
+	if isServer {
+		template += fmt.Sprintf("HiddenServicePort %s 127.0.0.1:%s\n", chatPort, chatPort)
+		template += fmt.Sprintf("HiddenServicePort 80 127.0.0.1:%s\n", httpPort)
+	} else {
+		template += "HiddenServicePort 80 127.0.0.1:8888\n"
+	}
+
+	return template
 }
 

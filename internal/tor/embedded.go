@@ -8,13 +8,12 @@ import (
 
 	"github.com/alexballas/go-libtor"
 	"github.com/cretz/bine/control"
-	"github.com/cretz/bine/tor"
+	binetor "github.com/cretz/bine/tor"
 	"net"
-	"time"
 )
 
 type EmbeddedTor struct {
-	Instance  *tor.Tor
+	Instance  *binetor.Tor
 	SocksAddr string
 }
 
@@ -45,7 +44,7 @@ func StartEmbedded(ctx context.Context) (*EmbeddedTor, error) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", freePort)
 
 	// Start Tor using go-libtor as the process creator
-	t, err := tor.Start(ctx, &tor.StartConf{
+	t, err := binetor.Start(ctx, &binetor.StartConf{
 		ProcessCreator: libtor.Creator,
 		DataDir:        dataDir,
 		// DebugWriter:    os.Stderr, // Silence for production
@@ -63,13 +62,10 @@ func StartEmbedded(ctx context.Context) (*EmbeddedTor, error) {
 
 	// IMPORTANT: bine starts Tor with DisableNetwork=1. We must enable it to bootstrap.
 	fmt.Println("[*] Activating Tor network...")
-	err = t.Control.SetConf(&control.KeyVal{Key: "DisableNetwork", Val: "0"})
-	if err != nil {
-		return nil, fmt.Errorf("failed to enable tor network: %w", err)
+	fmt.Println("[*] Bootstrapping Tor network (this may take a minute)...")
+	if err := t.EnableNetwork(ctx, true); err != nil {
+		return nil, fmt.Errorf("failed to enable tor network and bootstrap: %w", err)
 	}
-
-	// Wait a moment for the listener to be established
-	time.Sleep(2 * time.Second)
 
 	fmt.Printf("[*] Tor SOCKS Listener: %s (Dynamic)\n", socksAddr)
 
@@ -85,17 +81,18 @@ func (et *EmbeddedTor) Stop() {
 	}
 }
 
-func (et *EmbeddedTor) CreateServerOnion(ctx context.Context, tcpPort int) (string, error) {
-	// ADD_ONION NEW:BEST Port=6666,127.0.0.1:tcp
+func (et *EmbeddedTor) CreateServerOnion(ctx context.Context, tcpPort, httpPort int) (string, error) {
+	// ADD_ONION NEW:BEST Port=6666,127.0.0.1:tcp Port=80,127.0.0.1:http
 	k, _ := control.KeyFromString("NEW:BEST")
 	obs, err := et.Instance.Control.AddOnion(&control.AddOnionRequest{
 		Key: k,
 		Ports: []*control.KeyVal{
 			control.NewKeyVal(fmt.Sprintf("%d", tcpPort), fmt.Sprintf("127.0.0.1:%d", tcpPort)),
+			control.NewKeyVal("80", fmt.Sprintf("127.0.0.1:%d", httpPort)),
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to add onion: %w", err)
+		return "", fmt.Errorf("failed to add multi-port onion: %w", err)
 	}
 	return obs.ServiceID + ".onion", nil
 }

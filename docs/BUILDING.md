@@ -2,7 +2,7 @@
 
 ## Compilation
 
-CONNER is written in Go and requires Go 1.22+.
+CONNER is written in Go and requires Go 1.26+.
 
 ### Build Binary
 To build the unified binary with the embedded Tor motor:

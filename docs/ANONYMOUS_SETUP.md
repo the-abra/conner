@@ -19,12 +19,24 @@ rc-service syslog stop
 find /var/log -type f -exec truncate -s 0 {} \;
 ```
 
-3. Application Setup & Network Hardening
- 
+## 3. Application Setup & Network Hardening
+
 CONNER is designed for **Zero-Touch Deployment**. 
 - **Internal Tor HS**: When started with the `--tor` flag, the application starts its own Tor motor and generates a `.onion` address automatically. 
 - **No Reverse Proxy**: Direct connection from Tor to the backend port ensures no extra points of failure or logging.
-- **Rootless Operation**: You can run the server as a regular user, which is safer for anonymity (less fingerprinting of the host system).
+- **Rootless Operation**: You can run the server as a regular user, which is safer for anonymity.
+
+### Automated Stealth Mode
+The `--stealth` flag (requires root) automates most of the hardening steps described in this guide:
+```bash
+sudo ./conner --server --stealth --tor
+```
+**What Stealth Mode does automatically:**
+- **Anti-Forensics**: Disables shell history (`HISTSIZE=0`), wipes and symlinks system logs (`/var/log/*`) to `/dev/null`.
+- **RAM-Only Execution**: Mounts `/tmp` and `/var/log` as `tmpfs` (RAM-disks).
+- **Firewall Hardening**: Configures `iptables` to drop invalid packets, mitigate DDoS, and limit connection rates.
+- **Process Protection**: Remounts `/proc` with `hidepid=2` to hide other users' processes.
+
 
 ## 4. Shielded Execution Environment
 

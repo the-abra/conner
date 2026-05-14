@@ -10,8 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
 	"conner/internal/config"
 	"conner/internal/crypto"
 	"conner/internal/protocol"
@@ -37,7 +42,12 @@ type Server struct {
 	WhitelistMap   map[string]string // SigningPubKey (B64) -> Identity
 	CmdRegistry    *CommandRegistry
 	RoomKey       []byte // Central AES key (Ephemeral, wiped)
-	FileMetadata  map[string]*protocol.ChatMessage
+	VaultToken    string // Access token for HTTP (Kept)
+	VaultDir      string // Directory for server-side file storage
+	HTTPPort      int    // Internal port for the file server
+	RawConns      int32  // Atomic counter for active raw connections
+	Ready         chan struct{} // Signal when server is listening
+	AutoApprove   bool
 }
 
 type ServerStats struct {
@@ -132,7 +142,7 @@ func NewServer() *Server {
 		CmdRegistry:    NewCommandRegistry(),
 		BlacklistMap:   make(map[string]string),
 		WhitelistMap:   make(map[string]string),
-		FileMetadata:   make(map[string]*protocol.ChatMessage),
+		Ready:          make(chan struct{}),
 	}
 }
 
@@ -166,6 +176,15 @@ func (s *Server) GetBlockedList() []string {
 	return out
 }
 
+func (s *Server) Stop() {
+	s.mu.Lock()
+	s.Running = false
+	s.mu.Unlock()
+	if s.Listener != nil {
+		s.Listener.Close()
+	}
+}
+
 func (s *Server) Log(msg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -184,6 +203,13 @@ func (s *Server) Start(port string) error {
 	}
 	s.Listener = ln
 	s.Log(fmt.Sprintf("Server started on port %s", port))
+
+	s.VaultDir = "vault"
+	os.RemoveAll(s.VaultDir) // Clean up from previous run
+	os.MkdirAll(s.VaultDir, 0755)
+
+	// Start File Server (HTTP)
+	go s.startFileServer()
 
 	// Background loops
 	go func() {
@@ -230,14 +256,25 @@ func (s *Server) Start(port string) error {
 		s.mu.Lock()
 		s.Stats.TotalConnections++
 		s.mu.Unlock()
-		fmt.Printf("[*] DEBUG: Accept() returned! Handling connection from %s\n", conn.RemoteAddr().String())
+
+		// DDoS Guard: Limit concurrent raw connections
+		if atomic.LoadInt32(&s.RawConns) > 500 {
+			s.AddEvent("⚠️", "DDoS GUARD: Max raw connections (500) reached. Dropping incoming.")
+			conn.Close()
+			continue
+		}
+		atomic.AddInt32(&s.RawConns, 1)
+
 		go s.handleConnection(conn)
 	}
 	return nil
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		atomic.AddInt32(&s.RawConns, -1)
+	}()
 	remoteAddr := conn.RemoteAddr().String()
 	s.Log(fmt.Sprintf("Incoming connection: %s", remoteAddr))
 
@@ -377,7 +414,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.ClientManager.AddClient(remoteAddr, client)
 
 	// Handshake complete
-	if err := protocol.SendFrame(conn, []byte("HANDSHAKE_OK")); err != nil {
+	s.mu.RLock()
+	hPort := s.HTTPPort
+	s.mu.RUnlock()
+	okMsg := fmt.Sprintf("HANDSHAKE_OK|%d", hPort)
+	if err := protocol.SendFrame(conn, []byte(okMsg)); err != nil {
 		conn.Close()
 		return
 	}
@@ -386,15 +427,22 @@ func (s *Server) handleConnection(conn net.Conn) {
 	conn.SetDeadline(time.Time{}) //nolint:errcheck
 
 	// Notify client
-	if client.State == "WHITELISTED" {
-		s.SendSystemMessage(client, "✅ You have been approved by an admin!")
+	if isKeyWhitelisted || s.AutoApprove {
+		if !isKeyWhitelisted {
+			client.State = "WHITELISTED"
+		} else {
+			client.Nickname = whitelistedNick
+			client.State = "WHITELISTED"
+		}
+		
+		s.SendSystemMessage(client, "✅ You have been approved!")
 		s.BroadcastUserList()
 
 		// Log join to history
-		joinMsg := fmt.Sprintf("➜ %s joined the chat", nickname)
+		joinMsg := fmt.Sprintf("➜ %s joined the chat", client.Nickname)
 		s.DBManager.SaveMessage(config.MsgTypeJoin, joinMsg, "SERVER")
 
-		s.Log(fmt.Sprintf("Auto-approved user: %s (%s)", nickname, remoteAddr))
+		s.Log(fmt.Sprintf("Auto-approved user: %s (%s)", client.Nickname, remoteAddr))
 		s.RegenerateRoomKey()
 
 		// Broadcast join to others
@@ -515,95 +563,6 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return
 	}
 
-	if msg.Type == config.MsgTypeShare {
-		s.mu.Lock()
-		s.FileMetadata[msg.FileId] = msg
-		s.mu.Unlock()
-		s.Log(fmt.Sprintf("[SHARE] %s shared file: %s (ID: %s)", client.Nickname, msg.Content, msg.FileId))
-		
-		broadcastMsg := protocol.CreateMessage(config.MsgTypeShare, msg.Content, client.Nickname)
-		broadcastMsg.FileId = msg.FileId
-		s.BroadcastToState(client.State, broadcastMsg, client.Address)
-		return
-	}
-
-	if msg.Type == config.MsgTypeFileUpload {
-		os.MkdirAll("server_uploads", 0755)
-		path := filepath.Join("server_uploads", msg.FileId)
-		data, _ := crypto.Base64Decode(msg.Content)
-		
-		flags := os.O_CREATE | os.O_WRONLY
-		if msg.ChunkIdx > 0 {
-			flags |= os.O_APPEND
-		} else {
-			flags |= os.O_TRUNC
-		}
-		f, err := os.OpenFile(path, flags, 0644)
-		if err == nil {
-			f.Write(data)
-			f.Close()
-		}
-		
-		if msg.ChunkIdx == msg.TotalChunks-1 {
-			s.Log(fmt.Sprintf("[UPLOAD] %s finished uploading %s", client.Nickname, msg.FileId))
-		}
-		return
-	}
-
-	if msg.Type == config.MsgTypeFileDownloadReq {
-		path := filepath.Join("server_uploads", msg.FileId)
-		data, err := os.ReadFile(path)
-		if err == nil {
-			chunkSize := 512 * 1024
-			totalChunks := (len(data) + chunkSize - 1) / chunkSize
-			if len(data) == 0 {
-				totalChunks = 1
-			}
-			for i := 0; i < totalChunks; i++ {
-				start := i * chunkSize
-				end := start + chunkSize
-				if end > len(data) {
-					end = len(data)
-				}
-				
-				res := protocol.CreateMessage(config.MsgTypeFileDownloadRes, crypto.Base64Encode(data[start:end]), "SERVER")
-				res.FileId = msg.FileId
-				res.ReplyTo = msg.Content // Use ReplyTo for destPath
-				res.ChunkIdx = int32(i)
-				res.TotalChunks = int32(totalChunks)
-				
-				msgBytes, _ := res.Encode()
-				enc, _ := crypto.Encrypt(client.EncryptionKey, msgBytes)
-				client.SendChan <- crypto.Base64Encode(enc)
-			}
-		} else {
-			s.SendSystemMessage(client, "❌ Server could not find file: "+msg.FileId)
-		}
-		return
-	}
-
-	if msg.Type == config.MsgTypeGetFileMetadata {
-		s.mu.RLock()
-		meta, exists := s.FileMetadata[msg.Content]
-		s.mu.RUnlock()
-		if exists {
-			resp := protocol.CreateMessage(config.MsgTypeGetFileMetadata, meta.Content, "SERVER")
-			resp.FileId = meta.FileId
-			resp.OnionAddr = meta.OnionAddr
-			resp.FileToken = meta.FileToken
-			resp.ReplyTo = msg.Content // ID requested
-			
-			respBytes, _ := resp.Encode()
-			enc, _ := crypto.Encrypt(client.EncryptionKey, respBytes)
-			select {
-			case client.SendChan <- crypto.Base64Encode(enc):
-			default:
-			}
-		} else {
-			s.SendSystemMessage(client, "❌ File ID not found: "+msg.Content)
-		}
-		return
-	}
 
 	// Send ACK to sender for tracked message types
 	if (msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypePrivate) && msg.MessageId != "" {
@@ -639,6 +598,12 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return
 	}
 
+	if msg.Type == config.MsgTypeFileOffer {
+		s.Log(fmt.Sprintf("[FILE_OFFER] %s shared metadata: %s", client.Nickname, msg.Content))
+		s.BroadcastToState(client.State, msg, client.Address)
+		return
+	}
+
 	client.MessageCount++
 
 	switch client.State {
@@ -647,10 +612,8 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		s.Log(fmt.Sprintf("[WHITELIST] %s: %s", client.Nickname, msg.Content))
 	}
 
-	broadcastMsg := protocol.CreateMessage(config.MsgTypeChat, msg.Content, client.Nickname)
-	broadcastMsg.MessageId = msg.MessageId
-	broadcastMsg.IsAdmin = client.IsAdmin
-	s.BroadcastToState(client.State, broadcastMsg, client.Address)
+	// Relay the original message to preserve all fields (Type, FileId, OnionAddr, etc.)
+	s.BroadcastToState(client.State, msg, client.Address)
 }
 
 func (s *Server) handleCommand(client *Client, content string) {
@@ -729,10 +692,141 @@ func (s *Server) updateTorPorts() {
 	// For KISS, we'll assume the initial tor setup in embedded.go can handle multiple ports.
 }
 
+func (s *Server) startFileServer() {
+	mux := http.NewServeMux()
+	
+	// GET /download?f=filename&t=key_hash
+	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
+		filename := filepath.Base(r.URL.Query().Get("f"))
+		// Auth using SHA256 of the RoomKey
+		s.mu.RLock()
+		token := s.VaultToken
+		vaultDir := s.VaultDir
+		s.mu.RUnlock()
+
+		auth := r.Header.Get("Authorization")
+		tokenHeader := strings.TrimPrefix(auth, "Bearer ")
+		
+		// Support both Header and Query param for flexible client support
+		qToken := r.URL.Query().Get("t")
+		
+		if tokenHeader != token && qToken != token {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		path := filepath.Join(vaultDir, filename)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		http.ServeFile(w, r, path)
+	})
+	
+	// Alias for /download for older clients
+	mux.Handle("/f", http.StripPrefix("/f", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Re-route to /download logic or just alias it
+		r.URL.Path = "/download"
+		mux.ServeHTTP(w, r)
+	})))
+
+	// POST /upload?t=key_hash&u=nickname
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+		// Enforce 100MB limit
+		r.Body = http.MaxBytesReader(w, r.Body, 100*1024*1024)
+		
+		s.mu.RLock()
+		token := s.VaultToken
+		vaultDir := s.VaultDir
+		s.mu.RUnlock()
+
+		auth := r.Header.Get("Authorization")
+		tokenHeader := strings.TrimPrefix(auth, "Bearer ")
+		qToken := r.URL.Query().Get("t")
+
+		if tokenHeader != token && qToken != token {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		uploader := r.URL.Query().Get("u")
+		if uploader == "" { uploader = "Unknown" }
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "File too large or invalid", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		safeFilename := filepath.Base(header.Filename)
+		dstPath := filepath.Join(vaultDir, safeFilename)
+		dst, err := os.Create(dstPath)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer dst.Close()
+		io.Copy(dst, file)
+		
+		s.Log(fmt.Sprintf("[VAULT] %s uploaded %s", uploader, safeFilename))
+		w.Write([]byte("OK"))
+	})
+
+	// Background cleanup loop: Delete files older than 10 minutes
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.mu.RLock()
+			vDir := s.VaultDir
+			s.mu.RUnlock()
+			if vDir == "" { continue }
+
+			files, _ := os.ReadDir(vDir)
+			for _, f := range files {
+				info, err := f.Info()
+				if err == nil && time.Since(info.ModTime()) > 10*time.Minute {
+					os.Remove(filepath.Join(vDir, f.Name()))
+				}
+			}
+		}
+	}()
+
+	var listener net.Listener
+	var err error
+	port := 6667
+	for i := 0; i < 10; i++ {
+		listener, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+		if err == nil {
+			break
+		}
+		port++
+	}
+
+	if err != nil {
+		s.Log(fmt.Sprintf("Failed to start file server listener after 10 attempts: %v", err))
+		close(s.Ready)
+		return
+	}
+	
+	s.mu.Lock()
+	s.HTTPPort = port
+	s.mu.Unlock()
+	s.Log(fmt.Sprintf("File server (Vault) started on port %d", port))
+	close(s.Ready) // Signal that we are listening (both chat and file server are ready)
+	http.Serve(listener, mux)
+}
+
 func (s *Server) RegenerateRoomKey() {
 	s.mu.Lock()
 	newKey := make([]byte, 32)
 	_, _ = rand.Read(newKey)
+	
+	// VaultToken is now just the Hash of the RoomKey
+	// This lets the server verify the key without knowing the key!
+	h := sha256.New()
+	h.Write(newKey)
+	s.VaultToken = hex.EncodeToString(h.Sum(nil))
+	
 	s.RoomKey = newKey
 	s.mu.Unlock()
 
@@ -740,6 +834,7 @@ func (s *Server) RegenerateRoomKey() {
 	s.broadcastToWhitelisted(keyMsg)
 	
 	s.mu.Lock()
+	crypto.Wipe(s.RoomKey)
 	s.RoomKey = nil // Wipe content key from RAM
 	s.mu.Unlock()
 	
