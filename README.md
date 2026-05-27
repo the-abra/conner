@@ -1,4 +1,4 @@
-# 🛡️ CONNER: Zero-Knowledge Messaging & Sync Relay
+#  CONNER: Zero-Knowledge Messaging & Sync Relay
 
 CONNER is a high-speed, minimalist messaging platform designed for absolute privacy. It combines a centralized relay architecture with zero-knowledge E2EE (End-to-End Encryption) and **Automatic File Synchronization**, operating seamlessly over Tor or direct TCP connections.
 
@@ -36,7 +36,7 @@ CONNER supports two modes of operation: **Tor Mode** (for anonymity) and **Direc
 ./conner --tor <nickname> <onion_address>:6666
 ```
 
-## ⌨️ Commands
+## Commands
 
 - `/list`: See who is currently online.
 - `/private <nick> <msg>`: Send an encrypted private message.
