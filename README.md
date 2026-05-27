@@ -2,7 +2,7 @@
 
 CONNER is a high-speed, minimalist messaging platform designed for absolute privacy. It combines a centralized relay architecture with zero-knowledge E2EE (End-to-End Encryption) and **Automatic File Synchronization**, operating seamlessly over Tor or direct TCP connections.
 
-## 🚀 Key Features
+##  Key Features
 
 - **Blind Postman Relay**: The server relays encrypted data without ever having access to the decryption keys.
 - **Smart Sync**: Files shared by you go to `./uploads/`, and files received from others go to `./downloads/`. Full directory synchronization supported.
@@ -11,7 +11,7 @@ CONNER is a high-speed, minimalist messaging platform designed for absolute priv
 - **Auto-Approval**: Server can be set to automatically whitelist new connections for frictionless onboarding.
 - **Identity Verification**: Ed25519 identity keys ensure you are always talking to verified members.
 
-## 🛠️ Usage
+##  Usage
 
 CONNER supports two modes of operation: **Tor Mode** (for anonymity) and **Direct Mode** (for local speed).
 
@@ -44,7 +44,7 @@ CONNER supports two modes of operation: **Tor Mode** (for anonymity) and **Direc
 - `/help`: Show all available commands (F1 also works).
 - `/quit`: Disconnect and exit.
 
-### 🔄 Automated File Synchronization
+###  Automated File Synchronization
 CONNER features a zero-configuration background sync engine:
 1. **Drop it**: Move any file or folder into your local `./uploads/` directory.
 2. **Sync it**: The system automatically detects changes and chooses the best path:
@@ -60,7 +60,7 @@ CONNER features a zero-configuration background sync engine:
 CGO_ENABLED=1 go build -o conner ./cmd/conner/main.go
 ```
 
-## 📚 Documentation
+##  Documentation
 
 - [Architecture Overview](docs/ARCHITECTURE.md)
 - [Network Flows (Tor vs. Direct)](docs/NETWORK_FLOWS.md)
