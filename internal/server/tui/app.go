@@ -3,15 +3,17 @@ package tui
 import (
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"conner/internal/appdir"
+	"conner/internal/clipx"
 	"conner/internal/config"
+	"conner/internal/invite"
 	"conner/internal/protocol"
 	"conner/internal/server"
 	"conner/internal/server/sysmon"
+	"conner/internal/vaultui"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -83,10 +85,11 @@ const (
 	tabWhitelist
 	tabBlacklist
 	tabClients
+	tabVault
 	tabSystem
 )
 
-var tabNames = []string{"Dashboard", "Chat Room", "Blocked", "Clients", "System"}
+var tabNames = []string{"Dashboard", "Chat Room", "Blocked", "Clients", "Vault", "System"}
 
 // ─── Model ───────────────────────────────────────────────────────────────────
 
@@ -101,19 +104,21 @@ type Model struct {
 	statusMsg   string
 	sysSnap     sysmon.Snapshot // cached system metrics
 	showHelp    bool
+	selectHold  bool
+	frozenView  string
 }
 
 type tickMsg time.Time
 
 func tick() tea.Cmd {
-	return tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
 
 func InitialModel(s *server.Server) tea.Model {
 	ti := textinput.New()
-	ti.Placeholder = "/approve <user>  /block <user>  /kick <user>  /ann <msg>"
+	ti.Placeholder = "/approve  /kick  /ann   ·  Shift+Tab tabs  ·  Ctrl+Y copy"
 	ti.PromptStyle = lipgloss.NewStyle().Foreground(clrWhite)
 	ti.TextStyle = lipgloss.NewStyle().Foreground(clrWhite)
 	ti.Focus()
@@ -145,8 +150,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tickMsg:
-		// Refresh system snapshot on every tick (1s)
-		m.sysSnap = sysmon.Collect()
+		if !m.selectHold {
+			m.sysSnap = sysmon.Collect()
+		}
 		cmds = append(cmds, tick())
 
 	case tea.WindowSizeMsg:
@@ -171,9 +177,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 
+		case "ctrl+s":
+			m.selectHold = !m.selectHold
+			if m.selectHold {
+				m.statusMsg = "SELECT MODE — Shift+drag, then Ctrl+S"
+				m.frozenView = m.renderLive()
+			} else {
+				m.frozenView = ""
+				m.statusMsg = "live view"
+			}
+			return m, nil
+
 		case "ctrl+c":
 			m.srv.Running = false
 			return m, tea.Quit
+
+		case "ctrl+y":
+			text := m.copyTarget()
+			if err := clipx.Write(text); err != nil {
+				m.statusMsg = "clipboard unavailable"
+			} else {
+				m.statusMsg = "copied onion/invite (Shift+drag also works)"
+			}
+
+		case "ctrl+v":
+			if s, err := clipx.Read(); err == nil {
+				m.input.SetValue(m.input.Value() + clipx.Sanitize(s))
+			}
 
 		case "esc":
 			if m.showHelp {
@@ -254,10 +284,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filesCursor = 0
 			m.viewport.GotoTop()
 
-		case "up", "k", "down", "j", "pgup", "pgdown":
+		case "up", "k":
+			if m.tab == tabVault && m.filesCursor > 0 {
+				m.filesCursor--
+			} else {
+				m.viewport, cmd = m.viewport.Update(msg)
+				cmds = append(cmds, cmd)
+			}
+		case "down", "j":
+			if m.tab == tabVault {
+				m.filesCursor++
+			} else {
+				m.viewport, cmd = m.viewport.Update(msg)
+				cmds = append(cmds, cmd)
+			}
+		case "pgup", "pgdown":
 			m.viewport, cmd = m.viewport.Update(msg)
 			cmds = append(cmds, cmd)
 
+		case "d", "delete":
+			if m.tab == tabVault {
+				ents := vaultui.List(m.srv.VaultDir)
+				if len(ents) > 0 {
+					i := m.filesCursor
+					if i >= len(ents) {
+						i = len(ents) - 1
+					}
+					p := vaultui.SafeJoin(m.srv.VaultDir, ents[i].Name)
+					_ = os.Remove(p)
+					m.statusMsg = "deleted blob " + ents[i].Name
+				}
+			}
 
 		case "enter":
 			if m.showHelp {
@@ -357,34 +414,9 @@ func (m *Model) executeAdminCommand(val string) {
 		m.statusMsg = "🗑 Database purged"
 
 	case "/burn":
-		m.statusMsg = "🔥 CRITICAL: Initiating Secure Total Wipe..."
+		m.statusMsg = "wiping ~/.conner, vault, cwd leftovers"
 		go func() {
-			// Kill any local tor processes we started
-			exec.Command("pkill", "-9", "tor").Run()
-			time.Sleep(500 * time.Millisecond)
-
-			sensitiveDirs := []string{"vault", ".conner_data", "uploads", "downloads"}
-			
-			// Try to shred individual files in these directories first
-			for _, d := range sensitiveDirs {
-				_ = filepath.Walk(d, func(path string, info os.FileInfo, err error) error {
-					if err == nil && !info.IsDir() {
-						_ = exec.Command("shred", "-u", "-n", "3", path).Run()
-					}
-					return nil
-				})
-				_ = os.RemoveAll(d)
-			}
-
-			// Remove any identity stores and keys in current dir
-			files, _ := os.ReadDir(".")
-			for _, f := range files {
-				name := f.Name()
-				if strings.HasPrefix(name, "identities_") || strings.HasPrefix(name, "identity_") || strings.HasSuffix(name, ".key") {
-					_ = exec.Command("shred", "-u", "-n", "3", name).Run()
-					_ = os.Remove(name)
-				}
-			}
+			_ = appdir.Burn()
 			os.Exit(0)
 		}()
 
@@ -396,7 +428,22 @@ func (m *Model) executeAdminCommand(val string) {
 
 // ─── View ────────────────────────────────────────────────────────────────────
 
+func (m Model) copyTarget() string {
+	onion := strings.TrimSpace(m.srv.Stats.TorAddress)
+	if onion != "" {
+		return invite.Encode(invite.Blob{Onion: onion, Port: config.ServerPort, Tor: true, Room: config.DefaultRoom})
+	}
+	return invite.Encode(invite.Blob{Host: "127.0.0.1", Port: config.ServerPort, Tor: false, Room: config.DefaultRoom})
+}
+
 func (m Model) View() string {
+	if m.selectHold && m.frozenView != "" {
+		return m.frozenView
+	}
+	return m.renderLive()
+}
+
+func (m Model) renderLive() string {
 	if m.width == 0 {
 		return "Loading CONNER Admin Panel..."
 	}
@@ -413,7 +460,9 @@ func (m Model) View() string {
   /purge             Clear all chat history
   /burn              EMERGENCY SELF-DESTRUCT (Aggressive)
   /help              Show this menu
-  
+
+  [Ctrl+S]           Freeze screen for Shift+drag copy
+  [Ctrl+Y]           Copy invite blob to clipboard
   [Tab]              Auto-complete commands/users
   [Shift+Tab]        Switch between dashboard tabs
   [↑↓ / k j]         Scroll viewports / lists
@@ -458,7 +507,7 @@ func (m Model) View() string {
 	if m.statusMsg != "" {
 		sb.WriteString(styleStatus.Render(" " + m.statusMsg))
 	} else {
-		sb.WriteString(styleHelp.Render(" [Tab] switch  [↑↓] scroll  [D/Del] delete file  [Ctrl+C] quit"))
+		sb.WriteString(styleHelp.Render(" Ctrl+S freeze copy · Ctrl+Y invite · Shift+Tab tabs · Ctrl+C quit"))
 	}
 	sb.WriteString("\n")
 
@@ -498,8 +547,14 @@ func (m Model) renderTab() string {
 		stat := func(label, val string) string {
 			return fmt.Sprintf("  %-18s %s\n", label, lipgloss.NewStyle().Foreground(clrWhite).Render(val))
 		}
-		left.WriteString(stat("Tor Address:", truncate(m.srv.Stats.TorAddress, colW-22)))
-		left.WriteString(stat("Vault (HTTP):", fmt.Sprintf("Port %d", m.srv.HTTPPort)))
+		onion := strings.TrimSpace(m.srv.Stats.TorAddress)
+		torLine := "(bootstrapping or --pt system-tor — Ctrl+Y copies invite)"
+		if onion != "" {
+			torLine = onion
+		}
+		left.WriteString(stat("Tor:", torStatusLabel(onion, colW)))
+		left.WriteString(stat("Onion:", torLine))
+		left.WriteString(stat("Vault (HTTP):", fmt.Sprintf("127.0.0.1:%d (localhost fallback)", m.srv.HTTPPort)))
 		left.WriteString(stat("Uptime:", uptime.String()))
 		left.WriteString(stat("Total Connections:", fmt.Sprintf("%d", m.srv.Stats.TotalConnections)))
 		left.WriteString(stat("Messages Sent:", fmt.Sprintf("%d", m.srv.Stats.MessagesSent)))
@@ -603,6 +658,36 @@ func (m Model) renderTab() string {
 		}
 		return sb.String()
 
+	case tabVault:
+		dir := m.srv.VaultDir
+		ents := vaultui.List(dir)
+		var sb strings.Builder
+		sb.WriteString(styleTitle.Render(" VAULT (hub ciphertext) ") + "\n")
+		sb.WriteString(styleGray(fmt.Sprintf("  dir: %s\n", dir)))
+		sb.WriteString(styleGray(fmt.Sprintf("  http fallback: 127.0.0.1:%d  ·  mux FILE_PUT/GET on chat port\n\n", m.srv.HTTPPort)))
+		if len(ents) == 0 {
+			sb.WriteString("  (empty — members drop files in room outbox)\n")
+			return sb.String()
+		}
+		cur := m.filesCursor
+		if cur >= len(ents) {
+			cur = len(ents) - 1
+		}
+		if cur < 0 {
+			cur = 0
+		}
+		for i, e := range ents {
+			line := vaultui.Line(e, i == cur, m.width-4)
+			if i == m.filesCursor {
+				sb.WriteString(styleFileSelected.Render(line) + "\n")
+			} else {
+				sb.WriteString(styleFileLine.Render(line) + "\n")
+			}
+		}
+		sb.WriteString(styleGray(fmt.Sprintf("\n  %d blobs · %s  ·  ↑↓ select  D delete  (ciphertext only)\n",
+			len(ents), vaultui.FormatSize(vaultui.TotalBytes(ents)))))
+		return sb.String()
+
 	case tabSystem:
 		snap := m.sysSnap
 		if snap.CollectedAt.IsZero() {
@@ -694,11 +779,19 @@ func (m Model) renderTab() string {
 		// ── Services ──────────────────────────────────────────────────────────
 		sb.WriteString(styleGray("  ── Services ────────────────────────────────────────────"))
 		sb.WriteString("\n")
-		torStatus := lipgloss.NewStyle().Foreground(clrRed).Render("● STOPPED")
-		if snap.TorRunning {
-			torStatus = lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")
+		onion := strings.TrimSpace(m.srv.Stats.TorAddress)
+		torStatus := lipgloss.NewStyle().Foreground(clrYellow).Render("○ no onion yet")
+		if onion != "" {
+			torStatus = lipgloss.NewStyle().Foreground(clrWhite).Render("● onion ready (embedded or HS)")
+		} else if snap.TorRunning {
+			torStatus = lipgloss.NewStyle().Foreground(clrWhite).Render("● system tor process")
 		}
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Tor:", torStatus))
+		if onion != "" {
+			sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Onion:", onion))
+		} else {
+			sb.WriteString(styleGray("  Onion:            (Ctrl+Y still copies LAN invite if HS not published)\n"))
+		}
 		sb.WriteString(fmt.Sprintf("  %-18s %s\n", "Conner Server:", lipgloss.NewStyle().Foreground(clrWhite).Render("● RUNNING")))
 		sb.WriteString("\n")
 		sb.WriteString(styleGray(fmt.Sprintf("  Last updated: %s\n", snap.CollectedAt.Format("15:04:05"))))
@@ -711,6 +804,14 @@ func (m Model) renderTab() string {
 
 func styleGray(s string) string {
 	return lipgloss.NewStyle().Foreground(clrGray).Render(s)
+}
+
+func torStatusLabel(onion string, colW int) string {
+	if strings.TrimSpace(onion) != "" {
+		return "ready  (Ctrl+Y copies invite)"
+	}
+	_ = colW
+	return "waiting  (embedded bootstrap ≠ system `tor` process)"
 }
 
 func truncate(s string, max int) string {

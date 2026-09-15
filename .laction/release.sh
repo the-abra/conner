@@ -1,35 +1,30 @@
 #!/bin/sh
 set -e
 
-# Colors
-MAGENTA='\033[0;35m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+. "$(dirname "$0")/color.sh"
+. "$(dirname "$0")/cc.sh"
 
 mkdir -p bin/release
 
-echo "${MAGENTA}===> Starting Cross-Platform Release Build...${NC}"
-if [ -f /etc/alpine-release ]; then apk add --no-cache build-base; fi
+hdr "Release artifacts..."
+printf '  • linux/amd64 nocgo (always)\n'
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/release/conner-linux-amd64-nocgo ./cmd/conner
 
-# Linux amd64
-echo "  • Building linux/amd64..."
-CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o bin/release/conner-linux-amd64 ./cmd/conner/main.go
+if ensure_cc; then
+	printf '  • linux/amd64 CGO (embedded Tor)\n'
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/release/conner-linux-amd64 ./cmd/conner
+	printf '  • linux/arm64 CGO (may skip on this host)\n'
+	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/release/conner-linux-arm64 ./cmd/conner || printf 'skip arm64 cgo\n'
+else
+	printf '  skip CGO artifacts (no compiler)\n'
+fi
 
-# Linux arm64
-echo "  • Building linux/arm64..."
-CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -o bin/release/conner-linux-arm64 ./cmd/conner/main.go
+{
+	echo "CONNER SBOM (module list, not SPDX)"
+	go version
+	echo "module conner"
+	go list -m all
+} > bin/release/SBOM.txt
 
-# Windows amd64 (Note: Requires mingw-w64 for CGO cross-build)
-echo "  • Building windows/amd64..."
-CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -o bin/release/conner-windows-amd64.exe ./cmd/conner/main.go
-
-# Darwin amd64 (Note: Requires macOS SDK for CGO cross-build)
-echo "  • Building darwin/amd64..."
-CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -o bin/release/conner-darwin-amd64 ./cmd/conner/main.go
-
-# Darwin arm64
-echo "  • Building darwin/arm64..."
-CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o bin/release/conner-darwin-arm64 ./cmd/conner/main.go
-
-echo "${GREEN}✓ Release artifacts generated in bin/release/:${NC}"
-ls -lh bin/release/
+ok "bin/release/"
+ls -lh bin/release/ || true

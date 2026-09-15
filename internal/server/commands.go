@@ -1,8 +1,11 @@
 package server
 
 import (
-	"conner/internal/protocol"
+	"fmt"
 	"strings"
+
+	"conner/internal/crypto"
+	"conner/internal/protocol"
 )
 
 type CommandHandler func(s *Server, client *Client, args []string)
@@ -46,6 +49,8 @@ func (r *CommandRegistry) registerDefaults() {
 	r.Register("/block", handleBlock)
 	r.Register("/blacklist", handleBlock)
 	r.Register("/kick", handleKick)
+	r.Register("/room", handleRoom)
+	r.Register("/rooms", handleRooms)
 }
 
 func handleList(s *Server, client *Client, args []string) {
@@ -95,6 +100,7 @@ func handleOp(s *Server, client *Client, args []string) {
 	target := s.ClientManager.GetClientByNickname(args[0])
 	if target != nil {
 		target.IsAdmin = true
+		s.rememberAdmin(crypto.Base64Encode(target.SigningPubKey), target.Nickname)
 		s.SendSystemMessage(target, "You have been granted admin privileges.")
 		s.SendSystemMessage(client, args[0]+" is now an admin.")
 	}
@@ -131,4 +137,17 @@ func handleKick(s *Server, client *Client, args []string) {
 		s.removeClient(target)
 		s.SendSystemMessage(client, args[0]+" kicked.")
 	}
+}
+
+func handleRoom(s *Server, client *Client, args []string) {
+	if len(args) == 0 {
+		s.SendSystemMessage(client, "Usage: /room <name>")
+		return
+	}
+	rm := s.Rooms.Ensure(args[0])
+	s.SendSystemMessage(client, "room "+rm.ID+" epoch "+fmt.Sprint(rm.Epoch))
+}
+
+func handleRooms(s *Server, client *Client, args []string) {
+	s.SendSystemMessage(client, "Rooms: "+strings.Join(s.Rooms.List(), ", "))
 }

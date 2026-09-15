@@ -2,10 +2,8 @@ package client
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -14,13 +12,14 @@ import (
 	"sync"
 	"time"
 
+	"conner/internal/crypto"
 	"conner/internal/tor"
 )
 
 type P2PService struct {
 	OnionAddr string
 	Port      int
-	Token     string // Hash of the RoomKey
+	Token     string            // Hash of the RoomKey
 	files     map[string]string // FileID -> LocalPath
 	order     []string          // Keep track of insertion order
 	mu        sync.RWMutex
@@ -42,7 +41,9 @@ func StartP2PService(et *tor.EmbeddedTor) (*P2PService, error) {
 	if err != nil {
 		// Fallback to random port if 8888 is busy
 		listener, err = net.Listen("tcp", "127.0.0.1:0")
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 	}
 	s.Port = listener.Addr().(*net.TCPAddr).Port
 
@@ -107,7 +108,9 @@ func (s *P2PService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filepath.Base(localPath)))
-	io.Copy(w, f)
+	w.Header().Set("X-Conner-AEAD", "chunk-v1")
+	key := crypto.FileContentKey(myToken, fileID)
+	_ = crypto.EncryptReaderTo(w, f, key, fileID)
 }
 
 func (s *P2PService) AddFile(fileID, path string) {
@@ -122,7 +125,7 @@ func (s *P2PService) AddFile(fileID, path string) {
 	if len(s.order) > 20 {
 		oldID := s.order[0]
 		s.order = s.order[1:]
-		
+
 		oldPath, exists := s.files[oldID]
 		if exists {
 			delete(s.files, oldID)
@@ -140,11 +143,15 @@ func (s *P2PService) GetOnionAddr() string {
 	return s.OnionAddr
 }
 
-func (s *P2PService) UpdateToken(roomKey []byte) {
-	if len(roomKey) == 0 { return }
-	h := sha256.New()
-	h.Write(roomKey)
+func (s *P2PService) SetToken(token string) {
 	s.mu.Lock()
-	s.Token = hex.EncodeToString(h.Sum(nil))
+	s.Token = token
 	s.mu.Unlock()
+}
+
+func (s *P2PService) UpdateToken(roomKey []byte) {
+	if len(roomKey) == 0 {
+		return
+	}
+	s.SetToken(hex.EncodeToString(roomKey))
 }

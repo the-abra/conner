@@ -1,19 +1,25 @@
 #!/bin/sh
 set -e
 
-# Colors
-BLUE='\033[0;34m'
-GREEN='\033[0;32m'
-NC='\033[0m' # No Color
+. "$(dirname "$0")/color.sh"
+. "$(dirname "$0")/cc.sh"
 
-echo "${BLUE}===> [1/3] Preparing environment...${NC}"
-if [ -f /etc/alpine-release ]; then apk add --no-cache build-base; fi
-go mod tidy
+info "[1/4] Modules (locked go.sum, no tidy)..."
+go mod download
+go mod verify
 
-echo "${BLUE}===> [2/3] Running go vet...${NC}"
-go vet ./...
+info "[2/4] go vet..."
+CGO_ENABLED=0 go vet ./...
 
-echo "${BLUE}===> [3/3] Compilation check...${NC}"
-CGO_ENABLED=1 go build -o conner ./cmd/conner/main.go
+info "[3/4] nocgo binary (LAN / --pt system-tor)..."
+CGO_ENABLED=0 go build -trimpath -buildvcs=false -o /tmp/conner-nocgo ./cmd/conner
 
-echo "${GREEN}✓ Build & Vet completed successfully.${NC}"
+info "[4/4] CGO binary (embedded Tor)..."
+if ensure_cc; then
+	CGO_ENABLED=1 go build -trimpath -buildvcs=false -ldflags="-s -w" -o conner ./cmd/conner
+else
+	printf '  no C compiler; skip embedded-Tor (use --pt system-tor)\n'
+	cp /tmp/conner-nocgo conner
+fi
+
+ok "Build & vet ok."

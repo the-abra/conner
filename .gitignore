@@ -39,4 +39,9 @@ coverage.html
 
 # ─── Downloads directory (client-side media extraction) ────────────────────────
 downloads/
+uploads/
+vault/
+.conner/
+.conner_data/
 conner
+security-report.sarif

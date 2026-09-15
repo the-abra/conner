@@ -48,3 +48,11 @@ func TestRatchet(t *testing.T) {
 		t.Fatal("Should fail on past key")
 	}
 }
+
+func TestRatchetSkipWindow(t *testing.T) {
+	r := NewRatchet([]byte("01234567890123456789012345678901"))
+	_, err := r.GetMessageKey(200)
+	if err == nil {
+		t.Fatal("expected skip-window error")
+	}
+}

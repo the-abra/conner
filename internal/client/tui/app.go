@@ -3,21 +3,21 @@ package tui
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
+	"conner/internal/appdir"
 	"conner/internal/client"
 	"conner/internal/config"
 	"conner/internal/protocol"
 	"conner/internal/tor"
+	"conner/internal/vaultui"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/reflow/wrap"
 )
 
 // ─── Colour palette ──────────────────────────────────────────────────────────
@@ -124,31 +124,54 @@ type model struct {
 	typingUsers    map[string]time.Time
 	lastTypingSent time.Time
 	autoDownload   bool
-	reconnectTick  int // counter for reconnection attempts
-	
+	reconnectTick  int
+	currentRoom    string
+	bootstrapPct   int
+	highContrast   bool
+	filePane       bool
+	showVault      bool
+	vaultTab       int // 0 inbox, 1 outbox
+	vaultInbox     []vaultui.Entry
+	vaultOutbox    []vaultui.Entry
+	fileList       []string
+	fileCursor     int
+	unread         map[string]int
+	knownRooms     []string
+	statusHint     string
+	userCursor     int
+	helpVP         viewport.Model
+	followTail     bool
+	selectHold     bool
+	frozenView     string
+
 	// Connection params for retry
-	addr           string
-	useTor         bool
-	et             *tor.EmbeddedTor
+	addr   string
+	useTor bool
+	et     *tor.EmbeddedTor
 }
 
 func InitialModel(c *client.Client, nick string, addr string, useTor bool, et *tor.EmbeddedTor) tea.Model {
 	m := &model{
-		cli:         c,
-		nickname:    nick,
-		addr:        addr,
-		useTor:      useTor,
-		et:          et,
-		viewport:    viewport.New(0, 0),
-		state:       "PENDING",
-		typingUsers: make(map[string]time.Time),
+		cli:          c,
+		nickname:     nick,
+		addr:         addr,
+		useTor:       useTor,
+		et:           et,
+		viewport:     viewport.New(0, 0),
+		state:        "PENDING",
+		typingUsers:  make(map[string]time.Time),
+		currentRoom:  config.DefaultRoom,
+		unread:       make(map[string]int),
+		knownRooms:   []string{config.DefaultRoom},
+		highContrast: os.Getenv("CONNER_HIGH_CONTRAST") == "1",
+		followTail:   true,
 	}
 	if c == nil {
 		m.state = "BANNED"
 	}
 
 	ta := textarea.New()
-	ta.Placeholder = "Type a message... (Uploads: ./uploads/ | Downloads: ./downloads/)"
+	ta.Placeholder = "message  ·  Shift+drag copy  ·  Ctrl+Y last line  ·  F1 help"
 	ta.Focus()
 	ta.CharLimit = 4096
 	ta.SetWidth(80)
@@ -157,7 +180,7 @@ func InitialModel(c *client.Client, nick string, addr string, useTor bool, et *t
 	ta.ShowLineNumbers = false
 	ta.KeyMap.InsertNewline.SetKeys("shift+enter", "ctrl+j", "alt+enter")
 	m.input = ta
-	// We do not need PromptStyle/TextStyle config the same way as textinput, textarea uses its own styles.
+	m.applyContrast()
 	return m
 }
 
@@ -165,7 +188,7 @@ func (m model) Init() tea.Cmd {
 	if m.cli == nil {
 		return nil
 	}
-	return tea.Batch(textarea.Blink, m.waitForMsg())
+	return tea.Batch(textarea.Blink, m.waitForMsg(), tickVault())
 }
 
 func (m model) waitForMsg() tea.Cmd {
@@ -186,6 +209,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 
+	if km, ok := msg.(tea.KeyMsg); ok && km.String() == "ctrl+s" {
+		m.selectHold = !m.selectHold
+		if m.selectHold {
+			m.statusHint = "SELECT MODE — Shift+drag copy, then Ctrl+S"
+			m.frozenView = m.renderLive()
+		} else {
+			m.frozenView = ""
+			m.statusHint = "live view"
+		}
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 
 	case downloadDoneMsg:
@@ -201,9 +236,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.Contains(msg.Content, "Waiting for admin approval") {
 				m.state = "PENDING"
 			} else if strings.Contains(msg.Content, "You have been approved") {
-				m.state = "APPROVED"
+				m.state = ""
+				m.statusHint = "approved — you are in"
 			} else if strings.Contains(msg.Content, "Approved by shadow bot") {
-				m.state = "SHADOW_APPROVED"
+				m.state = ""
+				m.statusHint = "approved"
 			} else if strings.Contains(msg.Content, "You have been kicked") {
 				m.state = "KICKED"
 			} else if strings.Contains(msg.Content, "admin privileges") {
@@ -211,7 +248,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if strings.Contains(msg.Content, "Connection closed") {
 				if m.state != "KICKED" {
 					m.state = "DISCONNECTED"
-					cmds = append(cmds, m.attemptReconnect())
+					m.bootstrapPct = 5
+					cmds = append(cmds, m.attemptReconnect(), tickBootstrap())
 				}
 			}
 		}
@@ -263,6 +301,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.typingUsers[msg.Sender] = time.Now()
 			}
 		} else {
+			if msg.Type == config.MsgTypeChat {
+				room := msg.OnionAddr
+				if room == "" {
+					room = config.DefaultRoom
+				}
+				m.rememberRoom(room)
+				if room != m.currentRoom {
+					m.unread[room]++
+				}
+			}
 			rendered := m.renderMessage(msg)
 			if rendered != "" {
 				m.appendLine(rendered)
@@ -272,6 +320,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.waitForMsg())
 		return m, tea.Batch(cmds...)
 
+	case vaultTickMsg:
+		if m.showVault && !m.selectHold {
+			m.refreshFiles()
+		}
+		cmds = append(cmds, tickVault())
+
+	case bootstrapTickMsg:
+		if m.state == "DISCONNECTED" && m.bootstrapPct < 95 {
+			m.bootstrapPct += 7
+			if m.bootstrapPct > 95 {
+				m.bootstrapPct = 95
+			}
+			cmds = append(cmds, tickBootstrap())
+		}
 
 	case tea.MouseMsg:
 		if !m.showHelp {
@@ -288,17 +350,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			if m.showHelp {
 				m.showHelp = false
+			} else if m.showVault {
+				m.showVault = false
+				m.filePane = false
 			} else {
 				return m, tea.Quit
 			}
 
-		case "f1":
+		case "f1", "ctrl+h":
 			m.showHelp = !m.showHelp
+
+		case "ctrl+y", "ctrl+shift+c":
+			m.copyLastMessage()
+
+		case "ctrl+v":
+			m.pasteClipboard()
+
+		case "ctrl+u":
+			m.input.Reset()
+
+		case "ctrl+k":
+			m.viewport.LineUp(3)
+
+		case "ctrl+l":
+			m.viewport.LineDown(3)
+
+		case "ctrl+g":
+			m.followTail = true
+			m.viewport.GotoBottom()
+
+		case "ctrl+p":
+			m.prefillPrivate()
+
+		case "ctrl+f":
+			m.showVault = !m.showVault
+			m.filePane = m.showVault
+			m.fileCursor = 0
+			m.refreshFiles()
+
+		case "ctrl+o":
+			if m.showVault {
+				m.vaultTab = 1 - m.vaultTab
+				m.fileCursor = 0
+			}
+
+		case "ctrl+n":
+			m.cycleUser(1)
+
+		case "alt+right", "ctrl+right":
+			m.switchRoom(nextRoom(m.knownRooms, m.currentRoom))
+
+		case "alt+left", "ctrl+left":
+			m.switchRoom(prevRoom(m.knownRooms, m.currentRoom))
 
 		case "tab":
 			val := m.input.Value()
 			if strings.HasPrefix(val, "/") {
-				cmds := []string{"/list", "/private ", "/upload ", "/download ", "/help", "/quit"}
+				cmds := []string{"/list", "/private ", "/room ", "/rooms", "/files", "/vault", "/fp", "/trust ", "/approve ", "/kick ", "/block ", "/op ", "/burn", "/contrast", "/copy", "/paste", "/help", "/quit"}
 				current := strings.Split(val, " ")[0]
 
 				var matches []string
@@ -324,12 +432,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
-			if m.state == "APPROVED" || m.state == "SHADOW_APPROVED" {
-				m.state = ""
-				return m, nil
-			}
 			if m.showHelp {
 				m.showHelp = false
+				break
+			}
+			if m.showVault {
+				m.vaultActivate()
 				break
 			}
 			val := strings.TrimSpace(m.input.Value())
@@ -339,15 +447,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Reset()
 			cmds = append(cmds, m.handleInput(val))
 
-		case "up", "down", "pgup", "pgdown":
+		case "up":
+			if m.showHelp {
+				m.helpVP.LineUp(1)
+			} else if m.showVault || m.filePane {
+				if m.fileCursor > 0 {
+					m.fileCursor--
+				}
+			} else {
+				m.followTail = false
+				m.viewport.LineUp(1)
+			}
+		case "down":
+			if m.showHelp {
+				m.helpVP.LineDown(1)
+			} else if m.showVault || m.filePane {
+				n := len(m.vaultActive())
+				if n == 0 {
+					n = len(m.fileList)
+				}
+				if m.fileCursor < n-1 {
+					m.fileCursor++
+				}
+			} else {
+				m.viewport.LineDown(1)
+				if m.viewport.AtBottom() {
+					m.followTail = true
+				}
+			}
+		case "pgup":
+			m.followTail = false
+			m.viewport.HalfViewUp()
+		case "pgdown":
+			m.viewport.HalfViewDown()
+			if m.viewport.AtBottom() {
+				m.followTail = true
+			}
 		}
-		
+
 	case reconnectMsg:
 		if msg.err == nil {
 			m.cli = msg.cli
 			m.state = "" // Connected
 			m.reconnectTick = 0
-			m.appendSystem("🌐 Reconnected successfully!")
+			m.bootstrapPct = 100
+			m.appendSystem("reconnected")
 			cmds = append(cmds, m.waitForMsg())
 		} else {
 			m.reconnectTick++
@@ -358,15 +502,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.input.SetWidth(msg.Width - 6)
-		m.viewport.Width = msg.Width - 2
-		m.viewport.Height = msg.Height - 8 // adjust height to leave room for textarea
-		m.refreshViewport()
+		m.layoutChat()
+		if m.showVault {
+			m.refreshFiles()
+		}
 	}
 
-	if !m.showHelp {
+	if !m.showHelp && !shortcutConsumed(msg) {
 		m.input, cmd = m.input.Update(msg)
 		cmds = append(cmds, cmd)
-		
+
 		if _, ok := msg.(tea.KeyMsg); ok && m.state == "" {
 			val := m.input.Value()
 			if len(val) > 0 && !strings.HasPrefix(val, "/") {
@@ -394,26 +539,69 @@ func (m *model) handleInput(val string) tea.Cmd {
 		m.showHelp = true
 		return nil
 
+	case val == "/copy":
+		m.copyLastMessage()
+		return nil
+
+	case val == "/paste":
+		m.pasteClipboard()
+		return nil
+
 	case val == "/burn":
-		m.appendSystem("🔥 CRITICAL: Initiating Total Wipe...")
+		m.appendSystem("wipe ~/.conner + cwd leftovers")
 		m.refreshViewport()
 		go func() {
-			// Kill any local tor processes we started
-			exec.Command("pkill", "-9", "tor").Run()
-			time.Sleep(500 * time.Millisecond)
-			os.RemoveAll(".conner_data")
-			os.RemoveAll("uploads")
-			os.RemoveAll("downloads")
-			os.Remove("identity.key")
-			// Remove any identity store files
-			files, _ := os.ReadDir(".")
-			for _, f := range files {
-				if strings.HasPrefix(f.Name(), "identities_") {
-					os.Remove(f.Name())
-				}
-			}
+			_ = appdir.Burn()
 			os.Exit(0)
 		}()
+		return nil
+
+	case val == "/contrast":
+		m.highContrast = !m.highContrast
+		m.applyContrast()
+		m.appendSystem(fmt.Sprintf("high-contrast=%v (also CONNER_HIGH_CONTRAST=1)", m.highContrast))
+		m.refreshViewport()
+		return nil
+
+	case val == "/files", val == "/vault":
+		m.showVault = !m.showVault
+		m.filePane = m.showVault
+		m.fileCursor = 0
+		m.refreshFiles()
+		return nil
+
+	case val == "/fp":
+		fp := "(none)"
+		if m.cli != nil && len(m.cli.SigningPub) > 0 {
+			n := min(8, len(m.cli.SigningPub))
+			fp = fmt.Sprintf("%x", m.cli.SigningPub[:n])
+		}
+		m.appendSystem("identity fp prefix: " + fp)
+		m.refreshViewport()
+		return nil
+
+	case strings.HasPrefix(val, "/approve "), strings.HasPrefix(val, "/kick "), strings.HasPrefix(val, "/block "), strings.HasPrefix(val, "/op "), strings.HasPrefix(val, "/ann "):
+		cmd := protocol.CreateMessage(config.MsgTypeCmd, val, m.nickname)
+		m.cli.SendChan <- cmd
+		m.appendSystem("cmd: " + val)
+		m.refreshViewport()
+		return nil
+
+	case strings.HasPrefix(val, "/trust "):
+		nick := strings.TrimSpace(strings.TrimPrefix(val, "/trust "))
+		if nick != "" && m.cli != nil && m.cli.IdentityStore != nil {
+			m.cli.IdentityStore.Trust(nick, "")
+			m.appendSystem("trusted new identity for " + nick)
+			m.refreshViewport()
+		}
+		return nil
+
+	case strings.HasPrefix(val, "/room "):
+		name := strings.TrimSpace(strings.TrimPrefix(val, "/room "))
+		if name == "" {
+			return nil
+		}
+		m.switchRoom(name)
 		return nil
 
 	case strings.HasPrefix(val, "/react "):
@@ -431,7 +619,7 @@ func (m *model) handleInput(val string) tea.Cmd {
 			if targetID != "" {
 				reactionMsg := protocol.CreateMessage(config.MsgTypeReaction, targetID+"|"+emoji, m.nickname)
 				m.cli.SendChan <- reactionMsg
-				
+
 				// Echo locally
 				for i := len(m.rows) - 1; i >= 0; i-- {
 					if m.rows[i].MsgId == targetID {
@@ -450,7 +638,6 @@ func (m *model) handleInput(val string) tea.Cmd {
 		}
 		return nil
 
-
 	case strings.HasPrefix(val, "/private"):
 		parts := strings.SplitN(val, " ", 3)
 		if len(parts) == 3 {
@@ -461,7 +648,9 @@ func (m *model) handleInput(val string) tea.Cmd {
 			m.cli.SendChan <- msg
 			// Local echo for sent PM
 			cw := m.width - 2
-			if m.width > 40 { cw -= 20 }
+			if m.width > 40 {
+				cw -= 20
+			}
 			m.appendLine(lipgloss.NewStyle().
 				Foreground(clrAdmin).
 				Width(cw - 2).
@@ -511,6 +700,34 @@ func (m *model) appendSystem(text string) {
 	m.appendRow(chatRow{Rendered: styleSystem.Render("  · " + text)})
 }
 
+func (m *model) layoutChat() {
+	side := m.sidebarWidth()
+	chatW := m.width - side - 2
+	if chatW < 16 {
+		chatW = m.width - 2
+	}
+	m.viewport.Width = chatW
+	// title + room tabs + typing + input(3) + hint + padding
+	h := m.height - 10
+	if h < 4 {
+		h = 4
+	}
+	m.viewport.Height = h
+	m.helpVP.Width = min(m.width-4, 72)
+	m.helpVP.Height = min(m.height-4, 22)
+	m.refreshViewport()
+}
+
+func (m model) sidebarWidth() int {
+	if m.width < 56 {
+		return 0
+	}
+	if m.filePane {
+		return 24
+	}
+	return 18
+}
+
 func (m *model) refreshViewport() {
 	var lines []string
 	for _, row := range m.rows {
@@ -522,7 +739,7 @@ func (m *model) refreshViewport() {
 				text += " " + lipgloss.NewStyle().Foreground(clrDim).Render("✓")
 			}
 		}
-		
+
 		if len(row.Reactions) > 0 {
 			var reactionStrs []string
 			for emoji, users := range row.Reactions {
@@ -530,26 +747,26 @@ func (m *model) refreshViewport() {
 			}
 			text += "\n    " + lipgloss.NewStyle().Foreground(clrDim).Render("[ "+strings.Join(reactionStrs, "  ")+" ]")
 		}
-		
+
 		lines = append(lines, text)
 	}
 	rawContent := strings.Join(lines, "\n")
-	w := m.width - 2
+	w := m.viewport.Width - 1
 	if w < 10 {
 		w = 10
 	}
-	wrappedContent := wrap.String(rawContent, w)
-	content := lipgloss.NewStyle().Width(w).Render(wrappedContent)
-	m.viewport.SetContent(content)
-	m.viewport.GotoBottom()
+	m.viewport.SetContent(rawContent)
+	if m.followTail {
+		m.viewport.GotoBottom()
+	}
 }
 
 // ─── Render helpers ───────────────────────────────────────────────────────────
 
 func (m model) renderMarkdown(text string) string {
-	w := m.width - 25
-	if w < 40 {
-		w = 40
+	w := m.viewport.Width - 6
+	if w < 16 {
+		w = 16
 	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
@@ -579,7 +796,9 @@ func (m model) renderMessage(msg *protocol.ChatMessage) string {
 	case config.MsgTypePrivate:
 		// Private messages: teal accent, right aligned
 		cw := m.width - 2
-		if m.width > 40 { cw -= 20 }
+		if m.width > 40 {
+			cw -= 20
+		}
 		pm := lipgloss.NewStyle().
 			Foreground(clrAdmin).
 			Width(cw - 2).
@@ -622,10 +841,16 @@ func (m model) renderSelf(content string) string {
 // ─── View ─────────────────────────────────────────────────────────────────────
 
 func (m model) View() string {
+	if m.selectHold && m.frozenView != "" {
+		return m.frozenView
+	}
+	return m.renderLive()
+}
+
+func (m model) renderLive() string {
 	if m.width == 0 {
 		return "Connecting…"
 	}
-
 
 	// ── Overlay: PENDING ──────────────────────────────────────────────────
 	if m.state == "PENDING" {
@@ -633,10 +858,10 @@ func (m model) View() string {
   CONNECTION ESTABLISHED
   ─────────────────────────────────────────────
   Your nickname: %s
-  
+
   Please wait for an administrator to approve
   your connection.
-  
+
   [ESC] Disconnect
 `, m.nickname)
 		return lipgloss.Place(m.width, m.height,
@@ -644,21 +869,6 @@ func (m model) View() string {
 			stylePendingBox.Render(pending))
 	}
 
-	// ── Overlay: APPROVED ─────────────────────────────────────────────────
-	if m.state == "APPROVED" {
-		approved := fmt.Sprintf(`
-  ACCESS GRANTED
-  ─────────────────────────────────────────────
-  You have been approved by an admin!
-  
-  Nickname: %s
-  
-  Press [ ENTER ] to join the chat.
-`, m.nickname)
-		return lipgloss.Place(m.width, m.height,
-			lipgloss.Center, lipgloss.Center,
-			styleApprovedBox.Render(approved))
-	}
 	// ── Overlay: BANNED ───────────────────────────────────────────────────
 	if m.state == "BANNED" {
 		banned := fmt.Sprintf(`
@@ -666,9 +876,9 @@ func (m model) View() string {
   ─────────────────────────────────────────────
   You have been permanently banned from
   this server.
-  
+
   Identity: %s
-  
+
   [Ctrl+C] or [ESC] to Exit.
 `, m.nickname)
 		return lipgloss.Place(m.width, m.height,
@@ -683,9 +893,9 @@ func (m model) View() string {
   ─────────────────────────────────────────────
   You have been kicked from the server
   by an administrator.
-  
+
   Nickname: %s
-  
+
   [Ctrl+C] or [ESC] to Exit.
 `, m.nickname)
 		return lipgloss.Place(m.width, m.height,
@@ -693,33 +903,20 @@ func (m model) View() string {
 			styleKickedBox.Render(kicked))
 	}
 
-	// ── Overlay: SHADOW APPROVED ──────────────────────────────────────────
-	if m.state == "SHADOW_APPROVED" {
-		approved := fmt.Sprintf(`
-  ACCESS GRANTED (SHADOW)
-  ─────────────────────────────────────────────
-  You have been approved by an admin!
-  
-  Nickname: %s
-  
-  Press [ ENTER ] to join the chat.
-`, m.nickname)
-		return lipgloss.Place(m.width, m.height,
-			lipgloss.Center, lipgloss.Center,
-			styleKickedBox.Render(approved)) // Use red box for shadow
+	if m.showVault {
+		return m.renderVaultPage()
 	}
 
 	// ── Overlay: DISCONNECTED ─────────────────────────────────────────────
 	if m.state == "DISCONNECTED" {
 		disc := fmt.Sprintf(`
-  CONNECTION LOST
-  ─────────────────────────────────────────────
-  The connection to the server was lost.
-  
-  Nickname: %s
-  
-  [Ctrl+C] or [ESC] to Exit.
-`, m.nickname)
+		  CONNECTION LOST
+		  ─────────────────────────────────────────────
+		  Nickname: %s
+		  Retry %d · circuit rebuild every 5s
+		  Bootstrap ~%d%%
+		  [ESC] exit
+		`, m.nickname, m.reconnectTick, m.bootstrapPct)
 		return lipgloss.Place(m.width, m.height,
 			lipgloss.Center, lipgloss.Center,
 			styleKickedBox.Render(disc))
@@ -729,62 +926,87 @@ func (m model) View() string {
 	if m.showHelp {
 		adminCmds := ""
 		if m.isAdmin {
-			adminCmds = `  /connect <nick>    Approve a pending user
-  /block <nick>      Block and disconnect user
-  /kick <nick>       Disconnect a user
-  /ann <msg>         Send global announcement
-  /op <nick>         Grant admin permissions
-`
+			adminCmds = "  /approve <nick>    Approve pending user\n  /block <nick>      Ban and disconnect\n  /kick <nick>       Disconnect\n  /op <nick>         Grant admin\n  /ann <msg>         Announcement\n"
 		}
 
-		help := fmt.Sprintf(`
-  CONNER CLIENT — Commands
-  ─────────────────────────────────────
+		help := fmt.Sprintf(`CONNER — Commands
+─────────────────────────────────────
   /list              List online users
-  /private <u> <msg> Send private message
-  /burn              Panic switch: wipe identity & files
-%s  /help              Show this menu
-  /quit              Disconnect
+  /private <u; msg>   Pairwise DM
+  /room <name>       Switch/create room
+  /vault             Full-screen files page
+  /fp                Show identity prefix
+  /trust <nick>      Accept changed key
+  /contrast          High-contrast layout
+  /burn              Wipe profile & exit
+  /quit              Disconnect client
 
-  [Tab]              Auto-complete / commands
-  [Shift+Mouse]      Select & Copy text
-  [ESC / Enter / F1] Close this menu
-  [↑ ↓ PgUp PgDn]    Scroll chat
-  [Ctrl+C]           Force quit
-`, adminCmds)
-		return lipgloss.Place(m.width, m.height,
-			lipgloss.Center, lipgloss.Center,
-			styleHelp.Render(help))
+%s  Ctrl+S             Freeze screen to select & copy
+  Ctrl+Y             Copy last visible chat line
+  Ctrl+F             Vault page
+  Ctrl+O             Toggle inbox/outbox tabs
+  Ctrl+U             Clear message input
+  Ctrl+P             DM selected user
+  Ctrl+N             Cycle online users
+  Alt+← / Alt+→      Prev / next room
+  Ctrl+K / Ctrl+L    Scroll viewport
+  Ctrl+G             Jump to latest
+
+  ESC                Close help menu`, adminCmds)
+		m.helpVP.SetContent(help)
+		box := styleHelp.Width(m.helpVP.Width).Render(m.helpVP.View())
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 	}
 
 	// ── Main Chat View (WHITELISTED) ──────────────────────────────────────
 	var sb strings.Builder
 
-	// Title bar
-	sb.WriteString(styleTitleBar.Width(m.width - 2).
-		Render(fmt.Sprintf(" CONNER  ·  %s", m.nickname)))
+	mode := "LAN"
+	if m.useTor {
+		mode = "Tor"
+	}
+	role := "member"
+	if m.isAdmin {
+		role = "admin"
+	}
+	title := fmt.Sprintf(" CONNER %s  %s@%s  #%s  [%s]  %s",
+		config.Version, m.nickname, shortHost(m.addr), m.currentRoom, mode, role)
+	sb.WriteString(styleTitleBar.Width(m.width - 2).Render(title))
+	sb.WriteString("\n")
+	sb.WriteString(m.renderRoomTabs())
 	sb.WriteString("\n")
 
-	// Split View: Chat (left) | Users (right)
-	userListWidth := 20
-	chatWidth := m.width - userListWidth - 2
-	if chatWidth < 20 {
-		chatWidth = m.width - 2
-		userListWidth = 0
+	side := m.sidebarWidth()
+	chatW := m.width - side - 2
+	if chatW < 16 {
+		chatW = m.width - 2
+		side = 0
 	}
-
-	m.viewport.Width = chatWidth
+	m.viewport.Width = chatW
 	chatView := m.viewport.View()
 
-	if userListWidth > 0 {
+	if side > 0 {
 		var userListSB strings.Builder
-		userListSB.WriteString(lipgloss.NewStyle().Bold(true).Underline(true).Render("ONLINE USERS") + "\n")
-		for _, u := range m.onlineUsers {
-			// Only show nickname (part before first '(' if any, or just clean it)
-			nick := strings.Split(u, " (")[0]
-			userListSB.WriteString("• " + nick + "\n")
+		userListSB.WriteString(lipgloss.NewStyle().Bold(true).Render("people") + "\n")
+		if m.filePane {
+			userListSB.WriteString(lipgloss.NewStyle().Bold(true).Render("INBOX") + "\n")
+			for i, f := range m.fileList {
+				mark := "  "
+				if i == m.fileCursor {
+					mark = "> "
+				}
+				userListSB.WriteString(mark + f + "\n")
+			}
 		}
-		userListStr := styleUserList.Width(userListWidth).Height(m.viewport.Height).Render(userListSB.String())
+		for i, u := range m.onlineUsers {
+			nick := strings.Split(u, " (")[0]
+			mark := "• "
+			if i == m.userCursor {
+				mark = "> "
+			}
+			userListSB.WriteString(mark + nick + "\n")
+		}
+		userListStr := styleUserList.Width(side).Height(m.viewport.Height).Render(userListSB.String())
 
 		mainView := lipgloss.JoinHorizontal(lipgloss.Top, chatView, userListStr)
 		sb.WriteString(mainView)
@@ -803,7 +1025,7 @@ func (m model) View() string {
 			delete(m.typingUsers, user)
 		}
 	}
-	
+
 	if len(typing) > 0 {
 		typingText := strings.Join(typing, ", ")
 		if len(typing) == 1 {
@@ -811,17 +1033,259 @@ func (m model) View() string {
 		} else {
 			typingText += " are typing..."
 		}
-		sb.WriteString(styleDim.Render("  " + typingText) + "\n")
+		sb.WriteString(styleDim.Render("  "+typingText) + "\n")
 	}
 
 	// Input box
 	sb.WriteString(styleInputBox.Width(m.width - 4).Render(m.input.View()))
+	hint := "Ctrl+S freeze to copy · Ctrl+Y last line · Ctrl+F vault · F1"
+	if !m.followTail {
+		hint = "scrolled up · Ctrl+G latest  ·  " + hint
+	}
+	if m.statusHint != "" {
+		hint = m.statusHint
+	}
+	sb.WriteString("\n" + styleDim.Render("  "+hint))
 
 	return sb.String()
 }
+func (m *model) refreshFiles() {
+	in, out := "downloads", "uploads"
+	if m.cli != nil {
+		in = m.cli.InboxDir()
+		out = m.cli.OutboxDir()
+	}
+	m.vaultInbox = vaultui.List(in)
+	m.vaultOutbox = vaultui.List(out)
+	m.fileList = nil
+	for _, e := range m.vaultInbox {
+		m.fileList = append(m.fileList, e.Name)
+	}
+}
+
+func (m model) vaultActive() []vaultui.Entry {
+	if m.vaultTab == 1 {
+		return m.vaultOutbox
+	}
+	return m.vaultInbox
+}
+
+func (m *model) vaultActivate() {
+	ents := m.vaultActive()
+	if len(ents) == 0 {
+		m.statusHint = "vault empty — drop files in outbox"
+		return
+	}
+	i := m.fileCursor
+	if i < 0 || i >= len(ents) {
+		i = 0
+	}
+	dir := "downloads"
+	if m.cli != nil {
+		if m.vaultTab == 1 {
+			dir = m.cli.OutboxDir()
+		} else {
+			dir = m.cli.InboxDir()
+		}
+	}
+	path := vaultui.SafeJoin(dir, ents[i].Name)
+	_ = writeClipboard(path)
+	m.statusHint = "copied path: " + path
+}
+
+func (m model) renderVaultPage() string {
+	var sb strings.Builder
+	inDir, outDir := "downloads", "uploads"
+	if m.cli != nil {
+		inDir, outDir = m.cli.InboxDir(), m.cli.OutboxDir()
+	}
+	title := fmt.Sprintf(" VAULT  room #%s  ·  ciphertext on hub, plaintext in inbox ", m.currentRoom)
+	sb.WriteString(styleTitleBar.Width(m.width - 2).Render(title))
+	sb.WriteString("\n")
+	inMark, outMark := "inbox", "outbox"
+	if m.vaultTab == 0 {
+		inMark = "[inbox]"
+	} else {
+		outMark = "[outbox]"
+	}
+	sb.WriteString(styleDim.Render(fmt.Sprintf("  %s (%d)    %s (%d)    Ctrl+O switch · Enter copy path · ESC back",
+		inMark, len(m.vaultInbox), outMark, len(m.vaultOutbox))))
+	sb.WriteString("\n\n")
+	sb.WriteString(styleDim.Render("  drop files in: " + outDir + "\n"))
+	sb.WriteString(styleDim.Render("  received in:  " + inDir + "\n\n"))
+	ents := m.vaultActive()
+	if len(ents) == 0 {
+		sb.WriteString(styleSystem.Render("  (empty)\n"))
+	} else {
+		for i, e := range ents {
+			line := vaultui.Line(e, i == m.fileCursor, m.width-4)
+			if i == m.fileCursor {
+				sb.WriteString(styleSelf.Render(line) + "\n")
+			} else {
+				sb.WriteString(line + "\n")
+			}
+		}
+		sb.WriteString("\n" + styleDim.Render(fmt.Sprintf("  %d files · %s",
+			len(ents), vaultui.FormatSize(vaultui.TotalBytes(ents)))))
+	}
+	sb.WriteString("\n\n" + styleDim.Render("  Hub stores AEAD chunks only. Token is ACL, not a chat key."))
+	return sb.String()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (m *model) attemptReconnect() tea.Cmd {
 	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
 		newCli, err := client.Connect(m.nickname, m.addr, m.useTor, m.et)
 		return reconnectMsg{cli: newCli, err: err}
 	})
+}
+
+type vaultTickMsg struct{}
+
+func tickVault() tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return vaultTickMsg{} })
+}
+
+type bootstrapTickMsg struct{}
+
+func tickBootstrap() tea.Cmd {
+	return tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return bootstrapTickMsg{} })
+}
+
+func (m *model) rememberRoom(name string) {
+	for _, r := range m.knownRooms {
+		if r == name {
+			return
+		}
+	}
+	m.knownRooms = append(m.knownRooms, name)
+}
+
+func (m model) renderRoomTabs() string {
+	var parts []string
+	for _, r := range m.knownRooms {
+		parts = append(parts, formatRoomTab(r, r == m.currentRoom, m.unread[r]))
+	}
+	line := "  " + strings.Join(parts, "  ")
+	return styleDim.Render(line)
+}
+
+func (m model) roomBadge() string {
+	var parts []string
+	for _, r := range m.knownRooms {
+		n := m.unread[r]
+		if n > 0 {
+			parts = append(parts, fmt.Sprintf("%s(%d unread)", r, n))
+		} else if r == m.currentRoom {
+			parts = append(parts, r+"*")
+		} else {
+			parts = append(parts, r)
+		}
+	}
+	if len(parts) == 0 {
+		return m.currentRoom
+	}
+	return strings.Join(parts, ",")
+}
+
+func (m *model) switchRoom(name string) {
+	if name == "" || m.cli == nil {
+		return
+	}
+	m.currentRoom = name
+	m.unread[name] = 0
+	m.rememberRoom(name)
+	m.cli.SetRoomDirs(name)
+	join := protocol.CreateMessage(config.MsgTypeRoomJoin, name, m.nickname)
+	select {
+	case m.cli.SendChan <- join:
+	default:
+	}
+	m.statusHint = "room #" + name
+	m.appendSystem("switched to room #" + name)
+	m.refreshViewport()
+}
+
+func (m *model) copyLastMessage() {
+	text := ""
+	for i := len(m.rows) - 1; i >= 0; i-- {
+		text = lastVisibleLine(m.rows[i].Rendered)
+		if text != "" {
+			break
+		}
+	}
+	if text == "" {
+		m.statusHint = "nothing to copy"
+		return
+	}
+	if err := writeClipboard(text); err != nil {
+		m.statusHint = "clipboard unavailable (install wl-clipboard or xclip)"
+		m.appendSystem(m.statusHint)
+		return
+	}
+	m.statusHint = "copied last line"
+	m.appendSystem("copied to clipboard")
+	m.refreshViewport()
+}
+
+func (m *model) pasteClipboard() {
+	s, err := readClipboard()
+	if err != nil || s == "" {
+		m.statusHint = "clipboard empty or unavailable"
+		return
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	cur := m.input.Value()
+	m.input.SetValue(cur + s)
+	m.input.SetCursor(len(cur) + len(s))
+	m.statusHint = "pasted"
+}
+
+func (m *model) prefillPrivate() {
+	nick := m.selectedUser()
+	if nick == "" {
+		m.statusHint = "no user selected (Ctrl+N)"
+		return
+	}
+	val := "/private " + nick + " "
+	m.input.SetValue(val)
+	m.input.SetCursor(len(val))
+	m.statusHint = "dm " + nick
+}
+
+func (m *model) cycleUser(delta int) {
+	if len(m.onlineUsers) == 0 {
+		return
+	}
+	m.userCursor = (m.userCursor + delta) % len(m.onlineUsers)
+	if m.userCursor < 0 {
+		m.userCursor = len(m.onlineUsers) - 1
+	}
+	m.statusHint = "user " + m.selectedUser()
+}
+
+func (m model) selectedUser() string {
+	if len(m.onlineUsers) == 0 {
+		return ""
+	}
+	i := m.userCursor
+	if i < 0 || i >= len(m.onlineUsers) {
+		i = 0
+	}
+	return strings.Split(m.onlineUsers[i], " (")[0]
+}
+
+func (m *model) applyContrast() {
+	if !m.highContrast {
+		return
+	}
+	styleSelf = lipgloss.NewStyle().Bold(true).Underline(true)
+	styleOther = lipgloss.NewStyle().Bold(true)
+	styleSystem = lipgloss.NewStyle().Italic(true).Underline(true)
 }

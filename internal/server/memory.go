@@ -6,10 +6,10 @@ import (
 )
 
 type HistoryMessage struct {
-	Type      string `json:"type"`
-	Content   string `json:"content"`
-	Sender    string `json:"sender"`
-	Timestamp string `json:"timestamp"`
+	Type       string    `json:"type"`
+	Content    string    `json:"content"`
+	Sender     string    `json:"sender"`
+	Timestamp  string    `json:"timestamp"`
 	ParsedTime time.Time `json:"-"`
 }
 

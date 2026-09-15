@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: vet
+        run: CGO_ENABLED=0 go vet ./...
+      - name: build nocgo
+        run: CGO_ENABLED=0 go build -buildvcs=false -o /tmp/conner ./cmd/conner
+      - name: test
+        run: |
+          CGO_ENABLED=0 go test -count=1 ./internal/crypto ./internal/invite ./internal/protocol \
+            ./internal/rooms ./internal/appdir ./internal/store ./internal/client ./internal/client/tui \
+            ./internal/clipx ./internal/vaultui ./internal/filesync ./internal/server
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: race (no tor packages)
+        run: CGO_ENABLED=1 go test -count=1 -race ./internal/crypto ./internal/invite ./internal/protocol ./internal/rooms ./internal/store ./internal/appdir ./internal/clipx
+
+  gosec:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -exclude-dir=.laction ./...

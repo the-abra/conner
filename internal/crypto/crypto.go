@@ -3,52 +3,14 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
-	"crypto/ed25519"
 	"errors"
 	"io"
 
 	"golang.org/x/crypto/curve25519"
 )
-
-// EncryptStream encrypts from r to w using AES-CTR for high-performance streaming.
-func EncryptStream(key []byte, r io.Reader, w io.Writer) error {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return err
-	}
-	iv := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return err
-	}
-	// Write IV first
-	if _, err := w.Write(iv); err != nil {
-		return err
-	}
-	stream := cipher.NewCTR(block, iv)
-	writer := &cipher.StreamWriter{S: stream, W: w}
-	_, err = io.Copy(writer, r)
-	return err
-}
-
-// DecryptStream decrypts from r to w using AES-CTR for high-performance streaming.
-func DecryptStream(key []byte, r io.Reader, w io.Writer) error {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return err
-	}
-	iv := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(r, iv); err != nil {
-		return err
-	}
-	stream := cipher.NewCTR(block, iv)
-	reader := &cipher.StreamReader{S: stream, R: r}
-	_, err = io.Copy(w, reader)
-	return err
-}
-
-
 
 // GenerateKeyPair generates an X25519 keypair
 func GenerateKeyPair() (privateKey []byte, publicKey []byte, err error) {
@@ -60,15 +22,23 @@ func GenerateKeyPair() (privateKey []byte, publicKey []byte, err error) {
 	return privateKey, publicKey, err
 }
 
-// DeriveSharedKey generates a shared secret using X25519
+// DeriveSharedKey generates a shared secret using X25519 then HKDF-SHA256.
 func DeriveSharedKey(privateKey []byte, peerPublicKey []byte) ([]byte, error) {
-	return curve25519.X25519(privateKey, peerPublicKey)
+	raw, err := curve25519.X25519(privateKey, peerPublicKey)
+	if err != nil {
+		return nil, err
+	}
+	key, err := DeriveSessionKey(raw, "conner-session-v1")
+	Wipe(raw)
+	return key, err
 }
 
 // GenerateRandomKey generates a random AES key
 func GenerateRandomKey() []byte {
 	key := make([]byte, 32)
-	io.ReadFull(rand.Reader, key)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
 	return key
 }
 
@@ -132,5 +102,8 @@ func Sign(privateKey ed25519.PrivateKey, data []byte) []byte {
 
 // Verify verifies an Ed25519 signature
 func Verify(publicKey ed25519.PublicKey, data []byte, signature []byte) bool {
+	if len(publicKey) != ed25519.PublicKeySize || len(signature) != ed25519.SignatureSize {
+		return false
+	}
 	return ed25519.Verify(publicKey, data, signature)
 }

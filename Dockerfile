@@ -1,21 +1,21 @@
-# Stage 1: Build
-FROM golang:1.26-alpine AS builder
-RUN apk add --no-cache build-base
-WORKDIR /app
-COPY . .
-RUN go mod tidy
-RUN CGO_ENABLED=1 go build -o bin/conner ./cmd/conner/main.go
+# Build: Debian bookworm (glibc) so go-libtor/CGO links.
+# Runtime: distroless-ish slim Debian — not Alpine musl.
+# No go mod tidy (locked go.sum).
 
-# Stage 2: Runtime
-FROM alpine:latest
-# Install only optional tools (shred, img2sixel)
-RUN apk add --no-cache coreutils libsixel-bin
+FROM golang:1.26-bookworm AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/conner ./cmd/conner
+
+FROM debian:bookworm-slim
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& useradd --create-home --uid 1000 conner
 WORKDIR /app
 COPY --from=builder /app/bin/conner .
-
-# Ensure the app can run without root by default
-RUN adduser -D conner
 USER conner
-
-EXPOSE 80 6666
-CMD ["./conner", "--server"]
+EXPOSE 6666
+ENTRYPOINT ["./conner"]
+CMD ["--server", "--tor"]

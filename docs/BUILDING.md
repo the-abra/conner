@@ -1,74 +1,54 @@
-# Building and Deployment Guide
+# Building and deployment
 
-## Compilation
+Go **1.26+**. Module is locked (`go.sum`); CI does **not** run `go mod tidy`.
 
-CONNER is written in Go and requires Go 1.26+.
+Laction / Docker build image is **`golang:1.26-bookworm`** (glibc + gcc) so `--server --tor` can embed go-libtor. Alpine musl is a poor fit for that CGO stack; Arch is not pinned to Go 1.26.
 
-### Build Binary
-To build the unified binary with the embedded Tor motor:
+## Binary
+
 ```bash
-CGO_ENABLED=1 go build -o conner ./cmd/conner/main.go
+# Onion engine (go-libtor)
+CGO_ENABLED=1 go build -trimpath -buildvcs=false -ldflags="-s -w" -o conner ./cmd/conner
+
+# Tests / LAN without embedding Tor
+CGO_ENABLED=0 go build -o conner ./cmd/conner
 ```
 
-## System Dependencies
+`CGO_ENABLED=0` (or a nocgo `laction` leftover binary) **cannot** start embedded Tor — both hub and client hit the same stub. Rebuild with CGO, or `--pt system-tor`.
 
-CONNER is designed for **Zero-Dependency** operation. All critical components are embedded.
+Embedded Tor data dir is `~/.conner/tor` (not cwd `.conner_data`). Bootstrap waits up to 90s. SOCKS uses an ephemeral localhost port so it does not fight a system `tor` on 9050. Clients dial that port when `EmbeddedTor` is passed in.
 
-| Component | Required For | Status |
-|-----------|--------------|--------|
-| `tor` | Network Anonymity | **Embedded** |
-| `coreutils` | Secure deletion (`shred`) | Optional |
+## Tests
 
-### Auto-Setup
-The binary includes a minimal `autoSetup` feature that checks for the `shred` tool and warns if it's missing. It runs without root privileges.
-
-## Automated Pipelines (laction)
-
-We use `laction` to run reproducible builds and tests inside Docker containers. This ensures that the environment matches the deployment target.
-
-### Installation
 ```bash
-curl -sSL https://raw.githubusercontent.com/the-abra/local-actions/main/install.sh | bash
+CGO_ENABLED=0 go test ./internal/crypto ./internal/invite ./internal/protocol \
+  ./internal/rooms ./internal/appdir ./internal/store ./internal/client ./internal/client/tui \
+  ./internal/clipx ./internal/vaultui ./internal/filesync ./internal/server
+
+# race (needs CGO; skip Tor packages)
+CGO_ENABLED=1 go test -race ./internal/crypto ./internal/invite ./internal/protocol ./internal/rooms ./internal/store ./internal/appdir ./internal/clipx
 ```
 
-### Usage
-Run these commands from the project root:
+Package lists live in `.laction/pkgs.sh`. Color codes are only emitted when stdout is a TTY (`FORCE_COLOR=1` to force; `NO_COLOR` to disable). Laction captures logs as a pipe, so default output is plain text — that is expected.
 
-| Profile | Command | Description |
-|---------|---------|-------------|
-| **Default** | `laction .` | Runs `go mod tidy`, `go vet`, and `go build`. |
-| **Test** | `laction . test` | Runs tests with the race detector enabled. |
-| **Release** | `laction . release` | Builds binaries for Linux, Windows, and macOS. |
-| **Security**| `laction . security`| Runs `gosec` to identify potential vulnerabilities. |
+```
+`laction .            # bookworm image: vet + nocgo + CGO/embedded Tor
+laction . test       # unit tests; -race if compiler present
+laction . release    # linux amd64 nocgo + CGO artifacts, SBOM.txt
+laction . security   # gosec → security-report.sarif (non-fatal)
+```
 
-The configuration for these profiles is located in `laction.ini` and the scripts reside in `.laction/`.
+GitHub: `.github/workflows/ci.yml` (no `go mod tidy`). `.laction/static.sh` (host-specific `/opt` copy) was removed.
 
-## Docker Deployment
+## Docker
 
-The recommended way to deploy a CONNER server is via Docker:
+```bash
+docker build -t conner:latest .
+docker run --name conner-hub conner --server --tor
+```
 
-1. **Build Image**:
-   ```bash
-   docker build -t conner:latest .
-   ```
+No `go mod tidy` in the Dockerfile. `NET_ADMIN` is **not** required unless you add your own iptables.
 
-2. **Run Server**:
-   ```bash
-   docker run -d \
-     --name conner-server \
-     --cap-add=NET_ADMIN \
-     conner:latest --server --tor
-   ```
+## Release
 
-Note: `--cap-add=NET_ADMIN` is required for `iptables` to function correctly within the container.
-
-## Platform Specifics
-
-### Alpine Linux
-Optimized for memory-only execution. See `docs/ANONYMOUS_SETUP.md` for the ultimate stealth configuration.
-
-### Debian / Ubuntu
-Dependencies are managed via `apt`. The auto-setup script will handle the installation of `libsixel-bin` for image support.
-
-### Arch Linux
-Dependencies are managed via `pacman`.
+`.laction/release.sh` always builds `conner-linux-amd64-nocgo`, plus CGO linux/amd64 (and arm64 if the host can) when a C compiler exists. `SBOM.txt` is `go version` + `go list -m all`. Windows/Darwin CGO from Linux is not supported.

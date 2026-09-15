@@ -20,6 +20,8 @@ type Client struct {
 	LastSeen      time.Time
 	SigningPubKey []byte
 	E2EPubKey     []byte
+	winStart      time.Time
+	winCount      int
 }
 
 type ClientManager struct {
@@ -80,4 +82,16 @@ func (cm *ClientManager) Count() int {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return len(cm.clients)
+}
+
+func (cm *ClientManager) WhitelistedCount() int {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	n := 0
+	for _, c := range cm.clients {
+		if c.State == "WHITELISTED" {
+			n++
+		}
+	}
+	return n
 }

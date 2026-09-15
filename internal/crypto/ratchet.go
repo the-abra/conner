@@ -10,11 +10,11 @@ import (
 // Ratchet implements a symmetric-key forward secrecy ratchet.
 type Ratchet struct {
 	initialKey []byte
-	mu       sync.Mutex
-	chainKey []byte
-	step     uint32
+	mu         sync.Mutex
+	chainKey   []byte
+	step       uint32
 
-	// We can store skipped message keys if we receive out of order, 
+	// We can store skipped message keys if we receive out of order,
 	// but for simplicity we'll keep a basic window.
 	skippedKeys map[uint32][]byte
 }
@@ -54,7 +54,7 @@ func (r *Ratchet) Next() (msgKey []byte, step uint32) {
 
 	mk, nextCk := kdf(r.chainKey)
 	r.chainKey = nextCk
-	
+
 	currentStep := r.step
 	r.step++
 
@@ -78,7 +78,7 @@ func (r *Ratchet) GetMessageKey(targetStep uint32) ([]byte, error) {
 	}
 
 	// If it's too far in the future, limit the catch-up to prevent DoS
-	if targetStep - r.step > 100 {
+	if targetStep-r.step > 100 {
 		return nil, errors.New("target step is too far ahead")
 	}
 

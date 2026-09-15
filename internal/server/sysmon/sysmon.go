@@ -24,11 +24,11 @@ type Snapshot struct {
 	CollectedAt time.Time
 
 	// System
-	Hostname    string
-	OS          string
-	Arch        string
-	Goroutines  int
-	GoVersion   string
+	Hostname   string
+	OS         string
+	Arch       string
+	Goroutines int
+	GoVersion  string
 
 	// CPU
 	LoadAvg1  float64
@@ -45,9 +45,9 @@ type Snapshot struct {
 	SwapFreeKB     uint64
 
 	// Go Heap
-	GoAllocMB  float64
-	GoSysMB    float64
-	GoNumGC    uint32
+	GoAllocMB float64
+	GoSysMB   float64
+	GoNumGC   uint32
 
 	// Network
 	NetIfaces []NetIface
@@ -64,7 +64,7 @@ type Snapshot struct {
 
 // NetIface is per-interface RX/TX counters.
 type NetIface struct {
-	Name   string
+	Name string
 }
 
 // Collect reads all metrics that are accessible without elevated privileges.
@@ -153,7 +153,7 @@ func Collect() Snapshot {
 			_, _ = strconv.ParseUint(fields[0], 10, 64)
 			_, _ = strconv.ParseUint(fields[8], 10, 64)
 			s.NetIfaces = append(s.NetIfaces, NetIface{
-				Name:    name,
+				Name: name,
 			})
 		}
 		f.Close()

@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -13,13 +14,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"crypto/sha256"
-	"encoding/hex"
-	"io"
-	"net/http"
+	"conner/internal/appdir"
 	"conner/internal/config"
 	"conner/internal/crypto"
+	"conner/internal/logx"
 	"conner/internal/protocol"
+	"conner/internal/rooms"
+	"io"
+	"net/http"
 )
 
 // EventEntry is a single real-time notification in the dashboard feed.
@@ -41,13 +43,16 @@ type Server struct {
 	BlacklistMap   map[string]string // Identity -> Nickname (Metadata)
 	WhitelistMap   map[string]string // SigningPubKey (B64) -> Identity
 	CmdRegistry    *CommandRegistry
-	RoomKey       []byte // Central AES key (Ephemeral, wiped)
-	VaultToken    string // Access token for HTTP (Kept)
-	VaultDir      string // Directory for server-side file storage
-	HTTPPort      int    // Internal port for the file server
-	RawConns      int32  // Atomic counter for active raw connections
-	Ready         chan struct{} // Signal when server is listening
-	AutoApprove   bool
+	RoomKey        []byte        // Central AES key (Ephemeral, wiped)
+	VaultToken     string        // Access token for HTTP (Kept)
+	VaultDir       string        // Directory for server-side file storage
+	HTTPPort       int           // Internal port for the file server
+	RawConns       int32         // Atomic counter for active raw connections
+	Ready          chan struct{} // Signal when server is listening
+	AutoApprove    bool
+	Rooms          *rooms.Registry
+	BindLAN        bool
+	Admins         map[string]string // signing pub b64 -> nick
 }
 
 type ServerStats struct {
@@ -69,16 +74,26 @@ func (s *Server) ApproveClient(nickname string) bool {
 		return false
 	}
 	target.State = "WHITELISTED"
-	// ROTATE KEY: Destroy old room key and generate a fresh one for the new group state
-	s.RegenerateRoomKey()
-	
+	pubB64 := crypto.Base64Encode(target.SigningPubKey)
+	if s.isStoredAdmin(pubB64) || s.ClientManager.WhitelistedCount() == 1 {
+		target.IsAdmin = true
+		s.SendSystemMessage(target, "You have admin privileges.")
+	}
+	// Membership change: rotate sender-key epoch, keep vault file token.
+	s.BumpEpoch()
+
 	pubKeyB64 := crypto.Base64Encode(target.SigningPubKey)
 
 	s.mu.Lock()
 	s.WhitelistMap[pubKeyB64] = target.Nickname
 	delete(s.BlacklistMap, target.Identity)
 	s.mu.Unlock()
-	
+	if target.IsAdmin {
+		s.rememberAdmin(pubKeyB64, target.Nickname)
+	} else {
+		s.saveACL()
+	}
+
 	s.SendSystemMessage(target, "✅ You have been approved by an admin. Welcome!")
 	s.Log("Admin approved: " + nickname)
 	s.AddEvent("✅", "Admin approved: "+nickname+" → CHAT ROOM")
@@ -94,8 +109,10 @@ func (s *Server) BlockClient(nickname string) bool {
 
 	s.mu.Lock()
 	s.BlacklistMap[target.Identity] = target.Nickname
-	delete(s.WhitelistMap, target.Identity)
+	delete(s.WhitelistMap, crypto.Base64Encode(target.SigningPubKey))
+	delete(s.Admins, crypto.Base64Encode(target.SigningPubKey))
 	s.mu.Unlock()
+	s.saveACL()
 
 	s.SendSystemMessage(target, "⚡ You have been blocked from the server.")
 	go func() {
@@ -132,7 +149,7 @@ func NewServer() *Server {
 		}
 	}
 
-	return &Server{
+	s := &Server{
 		ClientManager:  NewClientManager(),
 		DBManager:      NewMemoryManager(config.MessageHistoryLimit, config.MessageTTL),
 		Running:        true,
@@ -143,7 +160,11 @@ func NewServer() *Server {
 		BlacklistMap:   make(map[string]string),
 		WhitelistMap:   make(map[string]string),
 		Ready:          make(chan struct{}),
+		Rooms:          rooms.NewRegistry(),
+		Admins:         make(map[string]string),
 	}
+	s.loadACL()
+	return s
 }
 
 // AddEvent appends a notification to the event log (max 200 entries).
@@ -194,19 +215,25 @@ func (s *Server) Log(msg string) {
 		s.ConsoleHistory = s.ConsoleHistory[len(s.ConsoleHistory)-1000:]
 	}
 	log.Println(entry)
+	logx.Info("hub", "msg", msg)
 }
 
 func (s *Server) Start(port string) error {
-	ln, err := net.Listen("tcp", "0.0.0.0:"+port)
+	return s.StartOn("127.0.0.1:" + port)
+}
+
+// StartOn binds the hub. WAN-safe default is 127.0.0.1 (onion maps in).
+// Use 0.0.0.0 only with --lan.
+func (s *Server) StartOn(addr string) error {
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	s.Listener = ln
-	s.Log(fmt.Sprintf("Server started on port %s", port))
+	s.Log(fmt.Sprintf("Server started on %s", addr))
 
-	s.VaultDir = "vault"
-	os.RemoveAll(s.VaultDir) // Clean up from previous run
-	os.MkdirAll(s.VaultDir, 0755)
+	s.VaultDir = appdir.Path("vault")
+	_ = os.MkdirAll(s.VaultDir, 0700)
 
 	// Start File Server (HTTP)
 	go s.startFileServer()
@@ -288,12 +315,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	nonce := crypto.GenerateRandomKey() // 32-byte nonce
-	err = protocol.SendFrame(conn, []byte(fmt.Sprintf("KEY_EXCHANGE:%s|%s|%d",
-		crypto.Base64Encode(pub),
-		crypto.Base64Encode(nonce),
-		crypto.PoWDifficulty)))
+	nonce := crypto.GenerateRandomKey()
+	ke := &protocol.KeyExchange{
+		X25519Pub:     pub,
+		Nonce:         nonce,
+		PowDifficulty: uint32(crypto.PoWDifficulty),
+		Version:       config.Version,
+	}
+	keBytes, err := protocol.Marshal(ke)
 	if err != nil {
+		return
+	}
+	if err := protocol.SendFrame(conn, keBytes); err != nil {
 		s.Log(fmt.Sprintf("Handshake failed: could not send KEY_EXCHANGE to %s: %v", remoteAddr, err))
 		return
 	}
@@ -304,54 +337,39 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	line := string(payload)
-	if !strings.HasPrefix(line, "CLIENT_HELLO:") {
-		conn.Close()
+	hello, err := protocol.UnmarshalHello(payload)
+	if err != nil || len(hello.GetX25519Pub()) == 0 {
+		_ = protocol.SendHandshakeErr(conn, "invalid hello")
+		return
+	}
+	if !protocol.CompatibleVersion(hello.GetVersion(), config.Version) {
+		_ = protocol.SendHandshakeErr(conn, "incompatible version: want "+config.ProtocolMajor)
+		return
+	}
+	if hello.GetNickname() == "" || len(hello.GetNickname()) > 32 {
+		_ = protocol.SendHandshakeErr(conn, "invalid nickname")
 		return
 	}
 
-	parts := strings.SplitN(line, ":", 7)
-	if len(parts) != 7 {
-		conn.Close()
+	if !crypto.VerifyPoW(nonce, hello.GetPowNonce(), crypto.PoWDifficulty) {
+		_ = protocol.SendHandshakeErr(conn, "Proof of Work verification failed")
 		return
 	}
 
-	// Verify PoW
-	powNonce, _ := crypto.Base64Decode(parts[6])
-	if len(powNonce) != 8 {
-		_ = protocol.SendFrame(conn, []byte("ERROR:Invalid PoW nonce"))
-		conn.Close()
-		return
-	}
-	var powNonceU64 uint64
-	binary.Read(strings.NewReader(string(powNonce)), binary.BigEndian, &powNonceU64)
-
-	if !crypto.VerifyPoW(nonce, powNonceU64, crypto.PoWDifficulty) {
-		_ = protocol.SendFrame(conn, []byte("ERROR:Proof of Work verification failed"))
-		conn.Close()
-		return
-	}
-
-	clientPubBytes, err := crypto.Base64Decode(parts[1])
-	if err != nil {
-		conn.Close()
-		return
-	}
-
+	clientPubBytes := hello.GetX25519Pub()
 	sessionKey, err := crypto.DeriveSharedKey(priv, clientPubBytes)
 	if err != nil {
-		conn.Close()
 		return
 	}
 
-	nickname := parts[2]
-	identity := parts[3]
-	clientSigningPub, _ := crypto.Base64Decode(parts[4])
-	clientSig, _ := crypto.Base64Decode(parts[5])
+	nickname := hello.GetNickname()
+	identity := hello.GetIdentity()
+	clientSigningPub := hello.GetSigningPub()
+	clientSig := hello.GetSignature()
 
 	// Verify Identity Signature
 	if !crypto.Verify(clientSigningPub, nonce, clientSig) {
-		_ = protocol.SendFrame(conn, []byte("ERROR:Identity verification failed (bad signature)"))
+		_ = protocol.SendHandshakeErr(conn, "bad identity signature")
 		conn.Close()
 		return
 	}
@@ -361,7 +379,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Check persistent maps BEFORE creating client
 	s.mu.RLock()
 	banNick, isBanned := s.BlacklistMap[identity]
-	
+
 	whitelistedNick := ""
 	isKeyWhitelisted := false
 	for k, v := range s.WhitelistMap {
@@ -371,7 +389,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		if v == nickname && k != pubKeyB64 {
 			s.mu.RUnlock()
-			_ = protocol.SendFrame(conn, []byte("ERROR:This nickname is owned by another identity"))
+			_ = protocol.SendHandshakeErr(conn, "nickname owned by another identity")
 			conn.Close()
 			return
 		}
@@ -379,19 +397,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.mu.RUnlock()
 
 	if isBanned {
-		_ = protocol.SendFrame(conn, []byte("ERROR:You are banned from this server (Identity: "+banNick+")"))
-		conn.Close()
+		_ = protocol.SendHandshakeErr(conn, "banned: "+banNick)
 		return
 	}
 
 	// Validate nickname — send an error frame before closing so the client
 	// shows a meaningful message instead of a bare disconnect.
 	if s.ClientManager.GetClientByNickname(nickname) != nil {
-		_ = protocol.SendFrame(conn, []byte("ERROR:nickname already taken"))
+		_ = protocol.SendHandshakeErr(conn, "nickname already taken")
 		conn.Close()
 		return
 	}
 
+	e2ePub := hello.GetE2EPub()
 	client := &Client{
 		Conn:          conn,
 		Nickname:      nickname,
@@ -403,11 +421,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 		SendChan:      make(chan string, 100),
 		LastSeen:      time.Now(),
 		SigningPubKey: clientSigningPub,
+		E2EPubKey:     e2ePub,
 	}
 
 	if isKeyWhitelisted {
 		client.Nickname = whitelistedNick
 		client.State = "WHITELISTED"
+		if s.isStoredAdmin(pubKeyB64) {
+			client.IsAdmin = true
+		}
 		s.Log("Auto-approved returning user: " + client.Nickname)
 	}
 
@@ -417,9 +439,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.mu.RLock()
 	hPort := s.HTTPPort
 	s.mu.RUnlock()
-	okMsg := fmt.Sprintf("HANDSHAKE_OK|%d", hPort)
-	if err := protocol.SendFrame(conn, []byte(okMsg)); err != nil {
-		conn.Close()
+	approved := isKeyWhitelisted || s.AutoApprove
+	if err := protocol.SendHandshakeOK(conn, hPort, approved); err != nil {
 		return
 	}
 
@@ -434,7 +455,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			client.Nickname = whitelistedNick
 			client.State = "WHITELISTED"
 		}
-		
+
 		s.SendSystemMessage(client, "✅ You have been approved!")
 		s.BroadcastUserList()
 
@@ -443,7 +464,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.DBManager.SaveMessage(config.MsgTypeJoin, joinMsg, "SERVER")
 
 		s.Log(fmt.Sprintf("Auto-approved user: %s (%s)", client.Nickname, remoteAddr))
-		s.RegenerateRoomKey()
+		pubB := crypto.Base64Encode(client.SigningPubKey)
+		if s.isStoredAdmin(pubB) || s.ClientManager.WhitelistedCount() == 1 {
+			client.IsAdmin = true
+			s.SendSystemMessage(client, "You have admin privileges.")
+			s.rememberAdmin(pubB, client.Nickname)
+		} else {
+			s.mu.Lock()
+			s.WhitelistMap[pubB] = client.Nickname
+			s.mu.Unlock()
+			s.saveACL()
+		}
+		s.BumpEpoch()
 
 		// Broadcast join to others
 		bMsg := protocol.CreateMessage(config.MsgTypeJoin, joinMsg, "SERVER")
@@ -494,7 +526,7 @@ func (s *Server) removeClient(client *Client) {
 		s.Log(fmt.Sprintf("Client disconnected: %s (%s)", client.Nickname, client.Address))
 		s.AddEvent("🔴", fmt.Sprintf("Disconnected: %s [%s]", client.Nickname, client.State))
 		s.BroadcastUserList()
-		s.RegenerateRoomKey()
+		s.BumpEpoch()
 	} else {
 		s.Log(fmt.Sprintf("Pending client disconnected: %s", client.Address))
 		s.AddEvent("🔌", fmt.Sprintf("Pending client dropped: %s", client.Address))
@@ -514,9 +546,14 @@ func (s *Server) SendSystemMessage(client *Client, content string) {
 }
 
 func (s *Server) SendMessage(client *Client, msg *protocol.ChatMessage) {
-	msgBytes, _ := msg.Encode()
-	enc, _ := crypto.Encrypt(client.EncryptionKey, msgBytes)
-
+	msgBytes, err := msg.Encode()
+	if err != nil {
+		return
+	}
+	enc, err := crypto.Encrypt(client.EncryptionKey, msgBytes)
+	if err != nil {
+		return
+	}
 	select {
 	case client.SendChan <- crypto.Base64Encode(enc):
 	default:
@@ -548,7 +585,13 @@ func (s *Server) processClientMessage(client *Client, text string) {
 	}
 
 	if msg.Type == config.MsgTypePong || msg.Type == config.MsgTypePing {
-		return // Heartbeat - just keeping connection alive
+		return
+	}
+	if msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypePrivate || msg.Type == config.MsgTypeFileOffer {
+		if !client.allowMessage() {
+			s.SendSystemMessage(client, "slow down (rate limit)")
+			return
+		}
 	}
 
 	if msg.Type == config.MsgTypeTyping {
@@ -563,7 +606,6 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return
 	}
 
-
 	// Send ACK to sender for tracked message types
 	if (msg.Type == config.MsgTypeChat || msg.Type == config.MsgTypePrivate) && msg.MessageId != "" {
 		ackMsg := protocol.CreateMessage(config.MsgTypeAck, msg.MessageId, "SERVER")
@@ -575,14 +617,13 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		}
 	}
 
-	// Handle Admin Commands
-	if msg.Type == config.MsgTypeChat && strings.HasPrefix(msg.Content, "/") {
+	if msg.Type == config.MsgTypeCmd || (msg.Type == config.MsgTypeChat && !msg.IsE2Ee && strings.HasPrefix(msg.Content, "/")) {
 		s.handleCommand(client, msg.Content)
 		return
 	}
 
 	if msg.Type == config.MsgTypePrivate {
-		s.Log(fmt.Sprintf("[PRIVATE] %s -> %s: %s", client.Nickname, msg.ReplyTo, msg.Content))
+		s.Log(fmt.Sprintf("[PRIVATE] %s -> %s (ciphertext)", client.Nickname, msg.ReplyTo))
 		targetClient := s.ClientManager.GetClientByNickname(msg.ReplyTo)
 		if targetClient != nil && targetClient.State == "WHITELISTED" {
 			msgBytes, _ := msg.Encode()
@@ -604,12 +645,21 @@ func (s *Server) processClientMessage(client *Client, text string) {
 		return
 	}
 
+	if msg.Type == config.MsgTypeFilePut {
+		s.handleFilePut(client, msg)
+		return
+	}
+	if msg.Type == config.MsgTypeFileGet {
+		s.handleFileGet(client, msg)
+		return
+	}
+
 	client.MessageCount++
 
 	switch client.State {
 	case "WHITELISTED":
-		s.DBManager.SaveMessage(config.MsgTypeChat, msg.Content, client.Nickname)
-		s.Log(fmt.Sprintf("[WHITELIST] %s: %s", client.Nickname, msg.Content))
+		s.DBManager.SaveMessage(config.MsgTypeChat, "[e2ee]", client.Nickname)
+		s.Log(fmt.Sprintf("[WHITELIST] %s: ciphertext", client.Nickname))
 	}
 
 	// Relay the original message to preserve all fields (Type, FileId, OnionAddr, etc.)
@@ -637,9 +687,10 @@ func (s *Server) BroadcastUserList() {
 	for _, c := range s.ClientManager.GetAllClients() {
 		if c.State == "WHITELISTED" {
 			// nick|signing_pub_b64
-			userInfos = append(userInfos, fmt.Sprintf("%s|%s", 
-				c.Nickname, 
-				crypto.Base64Encode(c.SigningPubKey)))
+			userInfos = append(userInfos, fmt.Sprintf("%s|%s|%s",
+				c.Nickname,
+				crypto.Base64Encode(c.SigningPubKey),
+				crypto.Base64Encode(c.E2EPubKey)))
 		}
 	}
 	userList := strings.Join(userInfos, ",")
@@ -694,7 +745,7 @@ func (s *Server) updateTorPorts() {
 
 func (s *Server) startFileServer() {
 	mux := http.NewServeMux()
-	
+
 	// GET /download?f=filename&t=key_hash
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		filename := filepath.Base(r.URL.Query().Get("f"))
@@ -706,10 +757,10 @@ func (s *Server) startFileServer() {
 
 		auth := r.Header.Get("Authorization")
 		tokenHeader := strings.TrimPrefix(auth, "Bearer ")
-		
+
 		// Support both Header and Query param for flexible client support
 		qToken := r.URL.Query().Get("t")
-		
+
 		if tokenHeader != token && qToken != token {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -719,9 +770,16 @@ func (s *Server) startFileServer() {
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
-		http.ServeFile(w, r, path)
+		f, err := os.Open(path)
+		if err != nil {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("X-Conner-AEAD", "chunk-v1")
+		_, _ = io.Copy(w, f)
 	})
-	
+
 	// Alias for /download for older clients
 	mux.Handle("/f", http.StripPrefix("/f", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Re-route to /download logic or just alias it
@@ -733,7 +791,7 @@ func (s *Server) startFileServer() {
 	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		// Enforce 100MB limit
 		r.Body = http.MaxBytesReader(w, r.Body, 100*1024*1024)
-		
+
 		s.mu.RLock()
 		token := s.VaultToken
 		vaultDir := s.VaultDir
@@ -748,7 +806,9 @@ func (s *Server) startFileServer() {
 			return
 		}
 		uploader := r.URL.Query().Get("u")
-		if uploader == "" { uploader = "Unknown" }
+		if uploader == "" {
+			uploader = "Unknown"
+		}
 
 		file, header, err := r.FormFile("file")
 		if err != nil {
@@ -765,8 +825,13 @@ func (s *Server) startFileServer() {
 			return
 		}
 		defer dst.Close()
-		io.Copy(dst, file)
-		
+		// Store the client stream as-is (AEAD chunks). Hub never sees file plaintext.
+		if _, err := io.Copy(dst, file); err != nil {
+			os.Remove(dstPath)
+			http.Error(w, "write failed", http.StatusInternalServerError)
+			return
+		}
+
 		s.Log(fmt.Sprintf("[VAULT] %s uploaded %s", uploader, safeFilename))
 		w.Write([]byte("OK"))
 	})
@@ -779,7 +844,9 @@ func (s *Server) startFileServer() {
 			s.mu.RLock()
 			vDir := s.VaultDir
 			s.mu.RUnlock()
-			if vDir == "" { continue }
+			if vDir == "" {
+				continue
+			}
 
 			files, _ := os.ReadDir(vDir)
 			for _, f := range files {
@@ -795,7 +862,7 @@ func (s *Server) startFileServer() {
 	var err error
 	port := 6667
 	for i := 0; i < 10; i++ {
-		listener, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+		listener, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			break
 		}
@@ -807,38 +874,133 @@ func (s *Server) startFileServer() {
 		close(s.Ready)
 		return
 	}
-	
+
 	s.mu.Lock()
 	s.HTTPPort = port
 	s.mu.Unlock()
 	s.Log(fmt.Sprintf("File server (Vault) started on port %d", port))
-	close(s.Ready) // Signal that we are listening (both chat and file server are ready)
+	s.RotateVaultToken()
+	close(s.Ready)
 	http.Serve(listener, mux)
 }
 
-func (s *Server) RegenerateRoomKey() {
-	s.mu.Lock()
-	newKey := make([]byte, 32)
-	_, _ = rand.Read(newKey)
-	
-	// VaultToken is now just the Hash of the RoomKey
-	// This lets the server verify the key without knowing the key!
-	h := sha256.New()
-	h.Write(newKey)
-	s.VaultToken = hex.EncodeToString(h.Sum(nil))
-	
-	s.RoomKey = newKey
-	s.mu.Unlock()
-
-	keyMsg := protocol.CreateMessage(config.MsgTypeRoomKey, crypto.Base64Encode(newKey), "SERVER")
-	s.broadcastToWhitelisted(keyMsg)
-	
+// BumpEpoch tells members to rotate sender keys. VaultToken is unchanged
+// so existing ciphertext in ~/.conner/vault stays downloadable.
+func (s *Server) BumpEpoch() {
 	s.mu.Lock()
 	crypto.Wipe(s.RoomKey)
-	s.RoomKey = nil // Wipe content key from RAM
+	s.RoomKey = nil
+	if s.VaultToken == "" {
+		newTok := make([]byte, 32)
+		_, _ = rand.Read(newTok)
+		s.VaultToken = hex.EncodeToString(newTok)
+	}
+	tok := s.VaultToken
 	s.mu.Unlock()
-	
-	s.AddEvent("🔄", "Group rotated. Keys updated for join/leave event.")
+	epochMsg := protocol.CreateMessage(config.MsgTypeEpoch, tok, "SERVER")
+	s.broadcastToWhitelisted(epochMsg)
+	s.AddEvent("🔄", "Membership epoch bumped. Sender keys rotate; vault token kept.")
+}
+
+func (s *Server) handleFilePut(client *Client, msg *protocol.ChatMessage) {
+	name := filepath.Base(msg.FileId)
+	if name == "" || name == "." {
+		return
+	}
+	s.mu.RLock()
+	vaultDir := s.VaultDir
+	s.mu.RUnlock()
+	path := filepath.Join(vaultDir, name)
+	if msg.ChunkIdx < 0 {
+		s.Log(fmt.Sprintf("[VAULT-MUX] %s put %s done", client.Nickname, name))
+		return
+	}
+	ct, err := crypto.Base64Decode(msg.Content)
+	if err != nil {
+		return
+	}
+	flag := os.O_CREATE | os.O_WRONLY
+	if msg.ChunkIdx == 0 {
+		flag |= os.O_TRUNC
+	} else {
+		flag |= os.O_APPEND
+	}
+	f, err := os.OpenFile(path, flag, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(ct)))
+	_, _ = f.Write(hdr[:])
+	_, _ = f.Write(ct)
+}
+
+func (s *Server) handleFileGet(client *Client, msg *protocol.ChatMessage) {
+	name := filepath.Base(msg.FileId)
+	if name == "" {
+		name = filepath.Base(msg.Content)
+	}
+	s.mu.RLock()
+	vaultDir := s.VaultDir
+	s.mu.RUnlock()
+	path := filepath.Join(vaultDir, name)
+	f, err := os.Open(path)
+	if err != nil {
+		s.SendSystemMessage(client, "file not in vault: "+name)
+		return
+	}
+	defer f.Close()
+	var idx int32
+	for {
+		var hdr [4]byte
+		if _, err := io.ReadFull(f, hdr[:]); err != nil {
+			break
+		}
+		n := binary.BigEndian.Uint32(hdr[:])
+		if n == 0 || n > 8*1024*1024 {
+			break
+		}
+		ct := make([]byte, n)
+		if _, err := io.ReadFull(f, ct); err != nil {
+			break
+		}
+		out := protocol.CreateMessage(config.MsgTypeFileData, crypto.Base64Encode(ct), "SERVER")
+		out.FileId = name
+		out.ChunkIdx = idx
+		s.SendMessage(client, out)
+		idx++
+	}
+	fin := protocol.CreateMessage(config.MsgTypeFileData, "", "SERVER")
+	fin.FileId = name
+	fin.ChunkIdx = -1
+	fin.TotalChunks = idx
+	s.SendMessage(client, fin)
+}
+
+func (s *Server) RotateVaultToken() {
+	s.mu.Lock()
+	if s.VaultToken != "" {
+		s.mu.Unlock()
+		return
+	}
+	newTok := make([]byte, 32)
+	_, _ = rand.Read(newTok)
+	s.VaultToken = hex.EncodeToString(newTok)
+	s.mu.Unlock()
+	s.saveACL()
+}
+
+// Rate-limit chat/file/private. Heartbeats and key sync are exempt.
+func (c *Client) allowMessage() bool {
+	now := time.Now()
+	if c.winStart.IsZero() || now.Sub(c.winStart) > config.RateLimitWindow {
+		c.winStart = now
+		c.winCount = 1
+		return true
+	}
+	c.winCount++
+	return c.winCount <= config.RateLimitMessages
 }
 
 func (s *Server) broadcastToWhitelisted(msg *protocol.ChatMessage) {

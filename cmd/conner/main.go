@@ -1,376 +1,229 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"io"
-	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
+	"os/signal"
 	"strings"
-	"time"
+	"syscall"
 
+	"conner/internal/appdir"
 	"conner/internal/client"
 	clienttui "conner/internal/client/tui"
 	"conner/internal/config"
+	"conner/internal/crypto"
+	"conner/internal/invite"
+	"conner/internal/logx"
 	"conner/internal/server"
-	"conner/internal/server/sysmon"
 	servertui "conner/internal/server/tui"
 	"conner/internal/tor"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"context"
-	"net"
 )
 
-var embeddedTor *tor.EmbeddedTor
-var serverOnion string
-
 func main() {
-	isServer := flag.Bool("server", false, "Run in server mode")
-	useTor := flag.Bool("tor", false, "Enable Tor integration (Onion service / SOCKS proxy)")
-	stealth := flag.Bool("stealth", false, "Enable anti-forensics and stealth mode")
-	srvPort := flag.String("port", "6666", "Server port to listen on (default 6666)")
-	flag.StringVar(srvPort, "p", "6666", "Server port to listen on (shorthand)")
-	forceStealth := flag.Bool("force-system-stealth", false, "Force aggressive system-wide forensic wiping (requires root)")
-	autoApprove := flag.Bool("auto-approve", false, "Automatically approve all incoming connections (Server Mode)")
-	
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage (Client): %s [options] <nickname> [address:port]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Usage (Server): %s --server [options]\n", os.Args[0])
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-
-	if err := autoSetup(*isServer); err != nil {
-		fmt.Printf("[!] Auto-setup warning: %v\n", err)
-	}
-
-	// Auto-enable/disable Tor for client based on target address
-	if !*isServer {
-		args := flag.Args()
-		address := "127.0.0.1:6666"
-		if len(args) >= 2 {
-			address = args[1]
-		}
-		
-		if strings.Contains(address, ".onion") {
-			if !*useTor {
-				fmt.Println("[*] Target address is an onion address. Auto-enabling Tor.")
-				*useTor = true
-			}
-		} else if *useTor {
-			fmt.Println("[*] Target address is not an onion address. Auto-disabling Tor.")
-			*useTor = false
-		}
-	}
-
-	if *useTor {
-		if err := startTor(*isServer, *srvPort); err != nil {
-			log.Fatalf("[!] Tor initialization failed: %v", err)
-		}
-	} else {
-		fmt.Println("[*] Tor is disabled. Running in direct-connection mode.")
-	}
-
-	if *stealth {
-		if os.Geteuid() != 0 {
-			log.Fatalf("[!] CRITICAL: Stealth mode requires root privileges (sudo).")
-		}
-		if err := enableStealth(*isServer); err != nil {
-			fmt.Printf("[!] Stealth mode activation failed: %v\n", err)
-		}
-	}
-
-	// Port sanity checks
-	var ports []string
-	if *isServer {
-		ports = append(ports, *srvPort)
-	} else {
-		ports = append(ports, "8888") // Local P2P Port
-	}
-	for _, p := range ports {
-		if err := checkPortAvailability(p); err != nil {
-			log.Fatalf("[!] Port Conflict: %v. Please ensure port %s is free.", err, p)
-		}
-	}
-
-	if *isServer {
-		runServer(*srvPort, *stealth, *forceStealth, *autoApprove)
-	} else {
-		runClient(*useTor, *stealth)
-	}
-
-	if embeddedTor != nil {
-		embeddedTor.Stop()
-	}
-}
-
-func runServer(port string, stealth bool, forceStealth bool, autoApprove bool) {
-	srv := server.NewServer()
-	srv.AutoApprove = autoApprove
-	
-	startErr := make(chan error, 1)
-	go func() {
-		startErr <- srv.Start(port)
-	}()
-
-	// Wait for server to start and bind its HTTP port
-	select {
-	case <-srv.Ready:
-	case <-time.After(10 * time.Second):
-		log.Fatalf("[!] Timeout waiting for server to start")
-	}
-
-	if embeddedTor != nil {
-		fmt.Println("[*] Generating Multi-Port Server Onion...")
-		pInt := 6666
-		fmt.Sscanf(port, "%d", &pInt)
-		onion, err := embeddedTor.CreateServerOnion(context.Background(), pInt, srv.HTTPPort)
-		if err != nil {
-			log.Fatalf("Failed to create multi-port onion: %v", err)
-		}
-		srv.Stats.TorAddress = onion
-		serverOnion = onion
-	} else if serverOnion != "" {
-		srv.Stats.TorAddress = serverOnion
-	}
-
-	if serverOnion != "" {
-		fmt.Println("\n" + strings.Repeat("=", 60))
-		fmt.Println("  CONNER SERVER IS READY (TOR MODE)")
-		fmt.Println(strings.Repeat("=", 60))
-		fmt.Printf("  YOUR ONION ADDRESS: %s:%s\n", serverOnion, port)
-		fmt.Println(strings.Repeat("=", 60))
-		fmt.Println("  (You can copy the address now)")
-		fmt.Print("  Press [ENTER] to launch the Admin Dashboard...")
-		fmt.Scanln()
-	} else {
-		srv.Stats.TorAddress = "127.0.0.1" // Default for local
-		fmt.Println("\n" + strings.Repeat("=", 60))
-		fmt.Println("  CONNER SERVER IS READY (DIRECT MODE)")
-		fmt.Println(strings.Repeat("=", 60))
-		fmt.Printf("  LISTENING ON: 0.0.0.0:%s\n", port)
-		fmt.Println(strings.Repeat("=", 60))
-		fmt.Print("  Press [ENTER] to launch the Admin Dashboard...")
-		fmt.Scanln()
-	}
-
-	if stealth {
-		if forceStealth {
-			if err := enableSystemStealth(); err != nil {
-				fmt.Printf("[!] System-wide stealth failed: %v\n", err)
-			}
-		}
-		log.SetOutput(io.Discard)
-	}
-
-	log.SetOutput(io.Discard) // Prevent leakage to terminal
-	p := tea.NewProgram(servertui.InitialModel(srv), tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := p.Run(); err != nil {
-		log.SetOutput(os.Stderr)
-		log.Fatal(err)
-	}
-}
-
-func runClient(useTor bool, stealth bool) {
-	args := flag.Args()
-	if len(args) < 1 {
-		flag.Usage()
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
 
-	nickname := args[0]
-	address := "127.0.0.1:6666" // default
+func run() error {
+	if err := appdir.Ensure(); err != nil {
+		return err
+	}
+
+	fs := flag.NewFlagSet("conner", flag.ExitOnError)
+	asServer := fs.Bool("server", false, "run hub")
+	useTor := fs.Bool("tor", false, "use Tor (WAN default for hub)")
+	autoApprove := fs.Bool("auto-approve", false, "auto-whitelist (LAN/lab only)")
+	lan := fs.Bool("lan", false, "bind 0.0.0.0 (clearnet/LAN); default hub bind is 127.0.0.1")
+	pt := fs.String("pt", "", "system-tor: use SOCKS 127.0.0.1:9050 (configure Snowflake in your torrc)")
+	pass := fs.String("passphrase", "", "wrap a marker in ~/.conner/identity/master.wrap")
+	port := fs.String("port", config.ServerPort, "hub listen port")
+	noTUI := fs.Bool("no-tui", false, "hub logs only")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+
+	args := fs.Args()
+
+	if *asServer {
+		logx.Info("start hub", "tor", *useTor, "lan", *lan, "pt", *pt)
+		return runServer(*useTor, *autoApprove, *lan, *pt, *port, *noTUI)
+	}
+
+	nick := ""
+	target := ""
+	if len(args) >= 1 {
+		nick = args[0]
+	}
 	if len(args) >= 2 {
-		address = args[1]
+		target = args[1]
+	}
+	if nick == "" {
+		usage()
+		return fmt.Errorf("nickname required")
+	}
+	if target == "" {
+		usage()
+		return fmt.Errorf("invite or host:port required")
 	}
 
-	// AUTO-PORT: If no port is specified, default to 6666
-	if address != "" && !strings.Contains(address, ":") {
-		address = address + ":6666"
-	}
-
-	cli, err := client.Connect(nickname, address, useTor, embeddedTor)
+	blob, err := invite.Decode(target)
 	if err != nil {
-		if err == client.ErrBanned {
-			p := tea.NewProgram(clienttui.InitialModel(nil, nickname, address, useTor, embeddedTor), tea.WithAltScreen(), tea.WithMouseCellMotion())
-			if _, err := p.Run(); err != nil {
-				log.Fatal(err)
-			}
-			return
+		return err
+	}
+	if *pt != "" {
+		blob.PT = *pt
+	}
+	wantTor := *useTor || blob.Tor || strings.Contains(blob.DialAddr(), ".onion")
+
+	var et *tor.EmbeddedTor
+	if wantTor && blob.PT != "system-tor" {
+		ctx := context.Background()
+		et, err = tor.StartEmbedded(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "embedded Tor failed (%v); trying system tor SOCKS\n", err)
+			et = nil
 		}
-		log.Fatalf("Failed to connect: %v", err)
 	}
 
+	if *pass != "" {
+		_ = os.Setenv("CONNER_PASSPHRASE", *pass)
+		_ = crypto.WriteWrapped(appdir.WrappedKeyFile(), *pass, []byte("conner-v3"))
+	}
+
+	cli, err := client.Connect(nick, blob.DialAddr(), wantTor, et)
+	if err != nil {
+		return err
+	}
+	room := blob.Room
+	if room == "" {
+		room = config.DefaultRoom
+	}
+	cli.SetRoomDirs(room)
 	cli.StartAutoSync()
 
-	if stealth {
-		log.SetOutput(io.Discard)
+	m := clienttui.InitialModel(cli, nick, blob.DialAddr(), wantTor, et)
+	// No mouse capture: the terminal keeps native Shift-select / copy.
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err = p.Run()
+	if cli.Cancel != nil {
+		cli.Cancel()
 	}
-
-	p := tea.NewProgram(clienttui.InitialModel(cli, nickname, address, useTor, embeddedTor), tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
+	if et != nil {
+		et.Stop()
 	}
+	return err
 }
 
-
-func autoSetup(isServer bool) error {
-	optionalTools := []string{}
-	if isServer {
-		optionalTools = append(optionalTools, "shred")
-	} else {
-		optionalTools = append(optionalTools, "shred", "img2sixel")
+func runServer(useTor, autoApprove, lan bool, pt, port string, noTUI bool) error {
+	if useTor && autoApprove && os.Getenv("CONNER_I_UNDERSTAND_OPEN_RELAY") != "1" {
+		return fmt.Errorf("refusing --auto-approve with Tor (open relay). set CONNER_I_UNDERSTAND_OPEN_RELAY=1 to override")
 	}
 
-	var missing []string
-	for _, tool := range optionalTools {
-		if _, err := exec.LookPath(tool); err != nil {
-			missing = append(missing, tool)
+	srv := server.NewServer()
+	srv.AutoApprove = autoApprove
+
+	bind := "127.0.0.1:" + port
+	if lan {
+		bind = "0.0.0.0:" + port
+	}
+
+	var et *tor.EmbeddedTor
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := srv.StartOn(bind); err != nil {
+			fmt.Fprintln(os.Stderr, "hub:", err)
+			cancel()
 		}
-	}
+	}()
 
-	for _, tool := range missing {
-		fmt.Printf("[!] Optional tool '%s' is missing. Some features may be limited.\n", tool)
-	}
-
-	return nil
-}
-
-func startTor(isServer bool, srvPort string) error {
-	// Always write the latest local torrc
-	fmt.Println("[*] Configuring Local Tor Instance...")
-	torrc := config.GetTorrcTemplate(isServer, srvPort, "6667")
-	_ = os.WriteFile(config.TorrcPath, []byte(torrc), 0600)
-
-	dir := filepath.Join(config.TorDataDir, "conner_chat")
-	if !isServer {
-		dir = filepath.Join(config.TorDataDir, "conner_client")
-	}
-	_ = os.MkdirAll(dir, 0700)
-
-	// Try system tor first (faster)
-	if _, err := exec.LookPath("tor"); err == nil {
-		fmt.Println("[*] Starting Local Tor process...")
-		_ = exec.Command("pkill", "-f", config.TorrcPath).Run()
-		time.Sleep(500 * time.Millisecond)
-
-		cmd := exec.Command("tor", "-f", config.TorrcPath, "--RunAsDaemon", "1")
-		if err := cmd.Run(); err == nil {
-			if isServer {
-				// Wait for hostname to be generated
-				hostnamePath := filepath.Join(config.TorDataDir, "conner_chat", "hostname")
-				for i := 0; i < 10; i++ {
-					if b, err := os.ReadFile(hostnamePath); err == nil {
-						serverOnion = strings.TrimSpace(string(b))
-						break
-					}
-					time.Sleep(1 * time.Second)
+	if useTor {
+		if pt == "system-tor" {
+			fmt.Println("Using system Tor SOCKS 127.0.0.1:9050")
+			fmt.Println("HiddenServicePort " + port + " 127.0.0.1:" + port)
+		} else {
+			fmt.Println("Starting embedded Tor (CGO). Bootstrap can take ~30–90s…")
+			var err error
+			et, err = tor.StartEmbedded(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "embedded Tor failed: %v\nfalling back to system Tor SOCKS 127.0.0.1:9050\n", err)
+				fmt.Println("Publish HiddenServicePort " + port + " 127.0.0.1:" + port)
+			} else {
+				defer et.Stop()
+				<-srv.Ready
+				onion, err := et.CreateServerOnion(ctx, atoi(port), srv.HTTPPort)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "onion: %v (hub still on %s)\n", err, bind)
+				} else {
+					srv.Stats.TorAddress = onion
+					blob := invite.Encode(invite.Blob{Onion: onion, Port: port, Tor: true, Room: config.DefaultRoom})
+					fmt.Println("Onion:", onion)
+					fmt.Println("Invite (no DNS):", blob)
 				}
 			}
-
-			sysmon.SetTorStatus(true)
-			return nil
 		}
-		fmt.Println("[!] Failed to start system Tor. Falling back to embedded Tor...")
-	}
-
-	fmt.Println("[*] Starting EMBEDDED Tor motor (This might take a few seconds)...")
-	et, err := tor.StartEmbedded(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to start any tor instance: %w", err)
-	}
-	embeddedTor = et
-	config.TorSocksAddr = et.SocksAddr
-
-	if isServer {
-		// Onion creation moved to runServer to wait for srv.HTTPPort
-	}
-
-	fmt.Println("[+] Tor is UP. Address: " + serverOnion)
-	sysmon.SetTorStatus(true)
-	return nil
-}
-
-func enableStealth(isServer bool) error {
-	if isServer {
-		fmt.Println("[*] Activating Session-Level Privacy...")
-		os.Setenv("HISTSIZE", "0")
-		os.Setenv("HISTFILE", "/dev/null")
 	} else {
-		os.Setenv("HISTSIZE", "0")
-		os.Setenv("HISTFILE", "/dev/null")
-		home := os.Getenv("HOME")
-		_ = exec.Command("shred", "-u", home+"/.bash_history").Run()
-		_ = exec.Command("shred", "-u", home+"/.sh_history").Run()
+		fmt.Println("LAN/direct hub on", bind)
+		fmt.Println("Invite:", invite.Encode(invite.Blob{Host: "127.0.0.1", Port: port, Tor: false, Room: config.DefaultRoom}))
 	}
 
-	return nil
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	if noTUI {
+		<-sig
+		srv.Stop()
+		return nil
+	}
+
+	p := tea.NewProgram(servertui.InitialModel(srv), tea.WithAltScreen())
+	go func() {
+		<-sig
+		p.Quit()
+	}()
+	_, err := p.Run()
+	srv.Stop()
+	return err
 }
 
-func enableSystemStealth() error {
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("system-wide stealth requires root")
-	}
-
-	fmt.Println("[*] Activating Anti-Forensics Shield...")
-	runCmd("sh", "-c", "echo 'export HISTSIZE=0' >> /etc/profile")
-	runCmd("sh", "-c", "echo 'export HISTFILE=/dev/null' >> /etc/profile")
-
-	fmt.Println("[*] Wiping system journals and forensic records...")
-	runCmd("journalctl", "--vacuum-time=1s")
-	runCmd("dmesg", "-C")
-	runCmd("truncate", "-s", "0", "/var/log/wtmp")
-	runCmd("truncate", "-s", "0", "/var/log/btmp")
-	runCmd("truncate", "-s", "0", "/var/log/lastlog")
-	runCmd("auditctl", "-D")
-
-	logs := []string{
-		"/var/log/messages", "/var/log/syslog", "/var/log/auth.log",
-		"/var/log/nginx/access.log", "/var/log/nginx/error.log",
-		"/var/lib/systemd/coredump/*",
-	}
-	for _, l := range logs {
-		if _, err := os.Stat(l); err == nil {
-			runCmd("shred", "-u", l)
-			os.Symlink("/dev/null", l)
+func atoi(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 6666
 		}
+		n = n*10 + int(c-'0')
 	}
-
-	fmt.Println("[*] Hardening firewall (DDoS mitigation)...")
-	runCmd("iptables", "-F")
-	runCmd("iptables", "-A", "INPUT", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP")
-	runCmd("iptables", "-A", "INPUT", "-p", "tcp", "--tcp-flags", "ALL", "ALL", "-j", "DROP")
-	runCmd("iptables", "-A", "INPUT", "-p", "tcp", "--dport", "6666", "-m", "connlimit", "--connlimit-above", "20", "-j", "REJECT")
-	runCmd("iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT")
-	runCmd("iptables", "-A", "INPUT", "-p", "tcp", "--dport", "80", "-j", "ACCEPT")
-	runCmd("iptables", "-A", "INPUT", "-p", "tcp", "--dport", "6666", "-j", "ACCEPT")
-	runCmd("iptables", "-P", "INPUT", "DROP")
-
-	fmt.Println("[*] Mounting RAM disks...")
-	runCmd("mount", "-t", "tmpfs", "-o", "size=128M,noexec,nosuid,nodev", "tmpfs", "/tmp")
-	runCmd("mount", "-t", "tmpfs", "-o", "size=64M,noexec,nosuid,nodev", "tmpfs", "/var/log")
-	runCmd("mount", "-o", "remount,hidepid=2", "/proc")
-
-	return nil
+	if n == 0 {
+		return 6666
+	}
+	return n
 }
 
-func checkPortAvailability(port string) error {
-	// Check on both 127.0.0.1 and 0.0.0.0
-	for _, addr := range []string{"127.0.0.1", "0.0.0.0"} {
-		ln, err := net.Listen("tcp", addr+":"+port)
-		if err != nil {
-			return fmt.Errorf("port %s is already in use on %s", port, addr)
-		}
-		_ = ln.Close()
-	}
-	return nil
-}
+func usage() {
+	fmt.Fprintf(os.Stderr, `CONNER v%s — onion-first group TUI (member E2EE)
 
-func runCmd(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+Hub:
+  conner --server --tor
+  conner --server --lan --port 6666          # bind all interfaces (LAN)
+  conner --server --tor --pt system-tor
+
+Join (invite blob or host:port, no DNS required):
+  conner <nick> <conner://v1/...>
+  conner --tor <nick> <onion>:6666
+  conner <nick> 127.0.0.1:6666
+
+Flags: --auto-approve (forbidden with --tor unless CONNER_I_UNDERSTAND_OPEN_RELAY=1)
+       --passphrase   wrap identity keys (also CONNER_PASSPHRASE)
+	       --pt system-tor
+
+Data dir: ~/.conner (override CONNER_HOME)
+`, config.Version)
 }

@@ -4,6 +4,34 @@ package protocol;
 
 option go_package = "conner/internal/protocol";
 
+message KeyExchange {
+    bytes x25519_pub = 1;
+    bytes nonce = 2;
+    uint32 pow_difficulty = 3;
+    string version = 4;
+}
+
+message ClientHello {
+    bytes x25519_pub = 1;
+    string nickname = 2;
+    string identity = 3;
+    bytes signing_pub = 4;
+    bytes signature = 5;
+    uint64 pow_nonce = 6;
+    bytes e2e_pub = 7;
+    string version = 8;
+}
+
+message HandshakeOk {
+    int32 vault_port = 1;
+    string version = 2;
+    bool approved = 3;
+}
+
+message HandshakeErr {
+    string reason = 1;
+}
+
 message ChatMessage {
     string type = 1;
     string content = 2;
