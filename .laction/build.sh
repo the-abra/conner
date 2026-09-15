@@ -16,7 +16,7 @@ CGO_ENABLED=0 go build -trimpath -buildvcs=false -o /tmp/conner-nocgo ./cmd/conn
 
 info "[4/4] CGO binary (embedded Tor)..."
 if ensure_cc; then
-	CGO_ENABLED=1 go build -trimpath -buildvcs=false -ldflags="-s -w" -o conner ./cmd/conner
+	CGO_ENABLED=1 CGO_CFLAGS="-w" go build -trimpath -buildvcs=false -ldflags="-s -w" -o conner ./cmd/conner
 else
 	printf '  no C compiler; skip embedded-Tor (use --pt system-tor)\n'
 	cp /tmp/conner-nocgo conner

@@ -12,9 +12,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflag
 
 if ensure_cc; then
 	printf '  • linux/amd64 CGO (embedded Tor)\n'
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/release/conner-linux-amd64 ./cmd/conner
+	CGO_ENABLED=1 CGO_CFLAGS="-w" GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/release/conner-linux-amd64 ./cmd/conner
 	printf '  • linux/arm64 CGO (may skip on this host)\n'
-	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/release/conner-linux-arm64 ./cmd/conner || printf 'skip arm64 cgo\n'
+	CGO_ENABLED=1 CGO_CFLAGS="-w" GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/release/conner-linux-arm64 ./cmd/conner || printf 'skip arm64 cgo\n'
 else
 	printf '  skip CGO artifacts (no compiler)\n'
 fi
